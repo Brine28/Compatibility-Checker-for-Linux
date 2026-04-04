@@ -1,6 +1,8 @@
-# 🐧 Linux Kernel Compatibility Checker v2.0
+# 🐧 Linux Kernel Compatibility Checker
 
 A terminal tool for Windows 11 users to analyze how compatible their system is before migrating to Linux.
+
+Scans hardware and system configuration to evaluate Linux migration readiness and produces a scored report.
 
 ---
 
@@ -8,10 +10,10 @@ A terminal tool for Windows 11 users to analyze how compatible their system is b
 
 | Score | Meaning              | Color   |
 |-------|----------------------|---------|
-| [0]   | Fully Compatible     | Green   |
-| [1]   | Compatible (Minor Issues Possible) | Yellow |
-| [2]   | Possibly Incompatible| Orange  |
-| [3]   | Incompatible         | Red     |
+| 0     | Fully Compatible     | Green   |
+| 1     | Compatible (minor issues) | Yellow |
+| 2     | Possibly Incompatible| Orange  |
+| 3     | Incompatible         | Red     |
 
 ---
 
@@ -37,18 +39,13 @@ A terminal tool for Windows 11 users to analyze how compatible their system is b
 ### MSVC (Visual Studio — Recommended)
 
 ```bat
-cl linux_compat_checker.c ^
-   /Fe:linux_compat_checker.exe ^
-   /link advapi32.lib setupapi.lib winhttp.lib
+cl linux_compat_checker.c /Fe:linux_compat_checker.exe /link advapi32.lib setupapi.lib winhttp.lib
 ```
 
-### MinGW / GCC
+### GCC / MinGW
 
 ```bash
-gcc linux_compat_checker.c \
-    -o linux_compat_checker.exe \
-    -ladvapi32 -lsetupapi -lwinhttp \
-    -masm=intel
+gcc linux_compat_checker.c -o linux_compat_checker.exe -ladvapi32 -lsetupapi -lwinhttp
 ```
 
 ### CMake
