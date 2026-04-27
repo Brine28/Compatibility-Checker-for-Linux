@@ -10,12 +10,12 @@ This tool scans your Windows 11 system and produces a detailed compatibility rep
 
 Results are categorized on a 4-point scale:
 
-| Score | Level                | Indicator | Meaning |
-|-------|----------------------|-----------|---------|
-| 0     | Fully Compatible     | ● (Green) | No known compatibility issues |
-| 1     | Compatible (Minor)   | ◑ (Yellow) | Minor issues may occur; generally compatible |
-| 2     | Possibly Incompatible| ◔ (Orange) | Significant concerns; careful evaluation needed |
-| 3     | Incompatible         | ○ (Red)    | Serious compatibility problems expected |
+| Score | Level                 | Indicator  | Meaning |
+|-------|-----------------------|------------|---------|
+| 0     | Fully Compatible      | ● (Green)  | No known compatibility issues |
+| 1     | Compatible (Minor)    | ◑ (Yellow) | Minor issues may occur; generally compatible |
+| 2     | Possibly Incompatible | ◔ (Orange) | Significant concerns; careful evaluation needed |
+| 3     | Incompatible          | ○ (Red)    | Serious compatibility problems expected |
 
 ---
 
@@ -23,17 +23,17 @@ Results are categorized on a 4-point scale:
 
 The scanner performs deep analysis of the following system components:
 
-- ✅ **CPU** — Vendor (Intel/AMD/ARM), brand string, core count, ISA extensions (SSE2, AVX, VT-x/AMD-V)
-- ✅ **RAM** — Total physical memory; Desktop/Laptop/Server adequacy assessment
-- ✅ **Storage** — Total capacity, free space, drive type detection (SSD/HDD/NVMe)
-- ✅ **Graphics (GPU)** — NVIDIA/AMD/Intel detection; open-source driver availability analysis
-- ✅ **Network** — Ethernet and WiFi adapters; chipset detection (Intel, Realtek, Broadcom, Atheros, etc.)
-- ✅ **Audio** — Sound card detection; driver compatibility assessment
-- ✅ **Firmware** — UEFI vs. Legacy BIOS detection
+- ✅ **CPU** — Vendor (Intel/AMD/ARM), brand string, core count, ISA extensions (SSE2, AVX, VT-x/AMD-V, AMD SVM)
+- ✅ **RAM** — Total physical memory; adequacy assessment for desktop workloads
+- ✅ **Storage** — Total capacity, free space, drive type detection (HDD / SATA SSD / NVMe SSD)
+- ✅ **Graphics (GPU)** — NVIDIA/AMD/Intel/Virtual detection; open-source driver availability analysis
+- ✅ **Network** — Ethernet and Wi-Fi adapters; chipset detection (Intel, Realtek, Broadcom, Atheros/Killer, MediaTek)
+- ✅ **Audio** — Sound card detection; driver compatibility assessment (HDA, Focusrite, Creative)
+- ✅ **Firmware** — UEFI vs. Legacy BIOS detection; BIOS vendor and version
 - ✅ **Secure Boot** — Current status and implications for Linux boot
-- ✅ **TPM** — Presence and version detection
-- ✅ **Power Management** — Battery/Power detection for laptop configurations
-- ✅ **Virtualization** — VMware, Hyper-V, VirtualBox detection
+- ✅ **TPM** — Presence detection
+- ✅ **Power Management** — Battery/power source detection for laptop configurations
+- ✅ **Virtualization** — Hypervisor detection (VMware, Hyper-V, VirtualBox, etc.)
 - ✅ **Kernel Version** — Fetches latest stable kernel from kernel.org (requires internet)
 
 ---
@@ -43,19 +43,21 @@ The scanner performs deep analysis of the following system components:
 ### Requirements
 
 - Windows 10 or later
-- C++17 compatible compiler (MSVC 2019+ or GCC 7.0+)
+- **C++23** compatible compiler (MSVC 2022+ or GCC 13+)
 - Optional: Internet connection for kernel.org online queries
 
-### MSVC (Visual Studio 2019+)
+> **Note:** The project uses C++23 features: `std::format`, `std::string_view::contains`, and `std::string::contains`. Earlier standards are not supported.
+
+### MSVC (Visual Studio 2022+)
 
 ```batch
-cl linux_compat_checker.cpp /Fe:linux_compat_checker.exe /EHsc /link advapi32.lib setupapi.lib winhttp.lib
+cl linux_compat_checker.cpp /Fe:linux_compat_checker.exe /EHsc /std:c++latest /link advapi32.lib setupapi.lib winhttp.lib
 ```
 
 ### GCC / MinGW-w64
 
 ```bash
-g++ linux_compat_checker.cpp -o linux_compat_checker.exe -std=c++17 -ladvapi32 -lsetupapi -lwinhttp
+g++ linux_compat_checker.cpp -o linux_compat_checker.exe -std=c++23 -ladvapi32 -lsetupapi -lwinhttp
 ```
 
 ### CMake
@@ -64,7 +66,7 @@ g++ linux_compat_checker.cpp -o linux_compat_checker.exe -std=c++17 -ladvapi32 -
 cmake_minimum_required(VERSION 3.16)
 project(LinuxCompatChecker CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(linux_compat_checker linux_compat_checker.cpp)
@@ -92,6 +94,7 @@ The program will scan your system and display a formatted report with color-code
 - Per-component compatibility scores with detailed recommendations
 - Overall compatibility percentage based on weighted critical components
 - Summary statistics of detected hardware
+- Enumeration failures are reported in the output (e.g. if SetupAPI cannot be accessed) rather than silently skipped
 
 ---
 
@@ -106,7 +109,16 @@ The program will scan your system and display a formatted report with color-code
 
 ## Technical Details
 
-- **Language**: C++17
+- **Language**: C++23
 - **Platform**: Windows 10+
 - **Libraries**: Windows API (SetupAPI, WinHTTP, Advapi32)
 - **Dependencies**: advapi32.lib, setupapi.lib, winhttp.lib (system libraries, no external downloads required)
+
+### Notable Implementation Details
+
+- Registry reads use `std::optional<T>` return values; callers use `.value_or()` for safe defaults
+- All string formatting uses `std::format` (C++20/23); no `sprintf`/`snprintf` in application logic
+- SetupAPI device enumeration is centralized in a single `Analyzer::enumerate_devices()` helper shared by GPU, Network, and Audio analyzers
+- WinHTTP responses are read in a loop until `WinHttpReadData` returns 0 bytes, avoiding incomplete reads
+- ANSI color codes are `inline constexpr const char*` constants instead of preprocessor macros
+- AMD SVM (virtualization) is detected separately from Intel VT-x using the correct CPUID leaf (`0x80000001 ECX bit 2`)
