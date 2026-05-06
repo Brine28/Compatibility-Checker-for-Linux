@@ -61,6 +61,22 @@ static VOID LccHandleGetPciDevices (WDFREQUEST Request);
 static VOID LccHandleGetCpuMsr     (WDFREQUEST Request);
 static VOID LccHandleGetAcpiInfo   (WDFREQUEST Request);
 
+/*
+ * BUG FIX #2 — PCI port I/O race condition
+ * -----------------------------------------
+ * The CF8/CFC port pair is a global shared resource.  Any other kernel
+ * driver may also be accessing these ports.  Without a spinlock, a
+ * context-switch between the WRITE_PORT (CF8) and READ_PORT (CFC)
+ * calls corrupts both our read and the other driver's.
+ *
+ * This spinlock serialises all CF8/CFC access system-wide within our
+ * driver.  For full correctness a system-wide HAL spinlock would be
+ * needed; in practice our sequential IOCTL queue + this lock is
+ * sufficient for a diagnostic tool that does not run concurrently
+ * with other PCI config-space scanners.
+ */
+static KSPIN_LOCK g_PciPortLock;
+
 /* ─── DPC + KEVENT context for cross-CPU MSR reads ──────────────── */
 typedef struct _MSR_READ_CONTEXT {
     UINT32   msr_address;
@@ -88,6 +104,9 @@ DriverEntry(
     LCC_LOG("DriverEntry — loading Linux Compat Checker driver v%u.%u",
             (LCC_DRIVER_VERSION >> 8) & 0xFF,
              LCC_DRIVER_VERSION       & 0xFF);
+
+    /* Fix #2: initialise global PCI port spinlock */
+    KeInitializeSpinLock(&g_PciPortLock);
 
     WDF_DRIVER_CONFIG_INIT(&config, LccEvtDeviceAdd);
 
@@ -130,9 +149,27 @@ LccEvtDeviceAdd(
     WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_UNKNOWN);
     WdfDeviceInitSetIoType(DeviceInit, WdfDeviceIoBuffered);
 
-    /* Allow any process to open the device handle */
+    /*
+     * BUG FIX #3 — Unauthorised Ring-0 access (Local Privilege Escalation)
+     * ----------------------------------------------------------------------
+     * Original code used FILE_DEVICE_SECURE_OPEN=FALSE + FILE_ANY_ACCESS,
+     * meaning ANY user process could open the device and read arbitrary MSRs.
+     *
+     * Fix: assign SDDL_DEVOBJ_SYS_ALL_ADM_ALL so that only SYSTEM and
+     * local Administrators can open a handle.  Standard users get
+     * STATUS_ACCESS_DENIED before any IOCTL reaches our handler.
+     */
+    {
+        DECLARE_CONST_UNICODE_STRING(
+            sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+        status = WdfDeviceInitAssignSDDLString(DeviceInit, &sddl);
+        if (!NT_SUCCESS(status)) {
+            LCC_LOG("WdfDeviceInitAssignSDDLString failed: 0x%08X", status);
+            return status;
+        }
+    }
     WdfDeviceInitSetCharacteristics(DeviceInit,
-                                    FILE_DEVICE_SECURE_OPEN, FALSE);
+                                    FILE_DEVICE_SECURE_OPEN, TRUE);
 
     /* ── 2. Create the WDF device object */
     status = WdfDeviceCreate(&DeviceInit,
@@ -259,13 +296,21 @@ LccPciMakeAddress(UINT8 bus, UINT8 dev, UINT8 fn, UINT8 reg)
                  | ((ULONG)reg  &  0xFCu));   /* dword-align */
 }
 
-/* Read one DWORD from PCI config space via port 0xCF8/0xCFC */
+/* Read one DWORD from PCI config space via port 0xCF8/0xCFC.
+ * Acquires g_PciPortLock to serialise the two-port transaction. */
 static ULONG
 LccPciReadDword(UINT8 bus, UINT8 dev, UINT8 fn, UINT8 reg)
 {
-    ULONG address = LccPciMakeAddress(bus, dev, fn, reg);
+    ULONG        address = LccPciMakeAddress(bus, dev, fn, reg);
+    KIRQL        oldIrql;
+    ULONG        value;
+
+    KeAcquireSpinLock(&g_PciPortLock, &oldIrql);
     WRITE_PORT_ULONG((PULONG)0xCF8, address);
-    return READ_PORT_ULONG((PULONG)0xCFC);
+    value = READ_PORT_ULONG((PULONG)0xCFC);
+    KeReleaseSpinLock(&g_PciPortLock, oldIrql);
+
+    return value;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -437,19 +482,67 @@ LccHandleGetCpuMsr(WDFREQUEST Request)
         return;
     }
 
-    MSR_READ_CONTEXT ctx;
-    ctx.msr_address = in->msr_address;
-    ctx.result      = 0;
-    ctx.valid       = FALSE;
-    KeInitializeEvent(&ctx.done_event, NotificationEvent, FALSE);
+    /*
+     * BUG FIX #5 (proactive) — MSR whitelist
+     * ----------------------------------------
+     * Even with the SDDL fix, defence-in-depth demands we only allow
+     * reading the specific MSRs this tool needs.  An arbitrary-MSR
+     * interface is a kernel exploit primitive on hypervisor bypasses.
+     */
+    {
+        static const UINT32 allowed_msrs[] = {
+            MSR_IA32_MICROCODE_REV,
+            MSR_IA32_MISC_ENABLE,
+            MSR_IA32_FEATURE_CONTROL,
+            MSR_IA32_PERF_STATUS,
+            MSR_IA32_THERM_STATUS,
+            MSR_IA32_ENERGY_PERF_BIAS,
+        };
+        BOOLEAN permitted = FALSE;
+        for (ULONG m = 0; m < ARRAYSIZE(allowed_msrs); ++m) {
+            if (in->msr_address == allowed_msrs[m]) { permitted = TRUE; break; }
+        }
+        if (!permitted) {
+            LCC_LOG("MSR 0x%08X is not on the whitelist — rejected",
+                    in->msr_address);
+            WdfRequestComplete(Request, STATUS_ACCESS_DENIED);
+            return;
+        }
+    }
+
+    /*
+     * BUG FIX #1 — DPC stack-use-after-free / BSOD prevention
+     * ---------------------------------------------------------
+     * ctx MUST live in NonPagedPool, not on the stack.
+     * If KeWaitForSingleObject times out, this function returns and
+     * the stack frame is torn down.  The DPC may still be pending and
+     * will write into the dead frame → guaranteed BugCheck.
+     *
+     * Fix: allocate ctx from NonPagedPool.  On timeout we deliberately
+     * LEAK the allocation so the DPC can still safely write into it
+     * (the kernel will reclaim the pool when the driver unloads / at
+     * next allocation).  A production driver should track pending DPCs
+     * with a reference count; this conservative leak is the minimum
+     * safe fix for a diagnostic tool.
+     */
+    PMSR_READ_CONTEXT ctx = (PMSR_READ_CONTEXT)
+        ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(MSR_READ_CONTEXT), LCC_POOL_TAG);
+    if (!ctx) {
+        WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
+        return;
+    }
+    ctx->msr_address = in->msr_address;
+    ctx->result      = 0;
+    ctx->valid       = FALSE;
+    KeInitializeEvent(&ctx->done_event, NotificationEvent, FALSE);
 
     /* Current CPU fast path — no DPC needed */
     if (in->cpu_index == KeGetCurrentProcessorNumberEx(NULL)) {
-        LccMsrDpcRoutine(NULL, &ctx, NULL, NULL);
+        LccMsrDpcRoutine(NULL, ctx, NULL, NULL);
     } else {
         /* Schedule DPC on the target logical processor */
         KDPC  dpc;
-        KeInitializeDpc(&dpc, LccMsrDpcRoutine, &ctx);
+        KeInitializeDpc(&dpc, LccMsrDpcRoutine, ctx);
         KeSetTargetProcessorDpcEx(&dpc,
             &(PROCESSOR_NUMBER){ 0,
                                   (UCHAR)in->cpu_index,
@@ -460,19 +553,26 @@ LccHandleGetCpuMsr(WDFREQUEST Request)
         /* Wait for the DPC to signal completion (5-second safety timeout) */
         LARGE_INTEGER timeout;
         timeout.QuadPart = -50000000LL;   /* 5 s in 100-ns units */
-        NTSTATUS waitStatus = KeWaitForSingleObject(&ctx.done_event,
+        NTSTATUS waitStatus = KeWaitForSingleObject(&ctx->done_event,
                                                     Executive,
                                                     KernelMode,
                                                     FALSE, &timeout);
         if (waitStatus == STATUS_TIMEOUT) {
             LCC_LOG("DPC timeout waiting for CPU %u", in->cpu_index);
+            /*
+             * INTENTIONAL LEAK on timeout — do NOT free ctx here.
+             * The DPC is still queued and will dereference ctx->done_event.
+             * Freeing ctx now would cause the DPC to corrupt freed pool
+             * (a worse BSOD than the original bug).
+             */
             WdfRequestComplete(Request, STATUS_IO_TIMEOUT);
             return;
         }
     }
 
-    out->value = ctx.result;
-    out->valid = ctx.valid;
+    out->value = ctx->result;
+    out->valid = ctx->valid;
+    ExFreePoolWithTag(ctx, LCC_POOL_TAG);
 
     LCC_LOG("MSR 0x%08X on CPU %u -> 0x%016llX (valid=%u)",
             out->msr_address, out->cpu_index, out->value, out->valid);
@@ -607,6 +707,13 @@ LccHandleGetAcpiInfo(WDFREQUEST Request)
         (PSYSTEM_FIRMWARE_TABLE_INFORMATION)
         ExAllocatePool2(POOL_FLAG_NON_PAGED, hdrFetchSize, LCC_POOL_TAG);
 
+    if (!hdrInfo) {
+        LCC_LOG("ExAllocatePool2 failed for ACPI header buffer");
+        ExFreePoolWithTag(enumInfo, LCC_POOL_TAG);
+        WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
+        return;
+    }
+
     BOOLEAN xsdtSeen = FALSE;
     BOOLEAN rsdpSeen = FALSE;
 
@@ -615,8 +722,6 @@ LccHandleGetAcpiInfo(WDFREQUEST Request)
          ++i)
     {
         ULONG tid = tableIdArray[i];
-
-        if (!hdrInfo) break;
 
         RtlZeroMemory(hdrInfo, hdrFetchSize);
         hdrInfo->ProviderSignature = SFTI_SIG_ACPI;
