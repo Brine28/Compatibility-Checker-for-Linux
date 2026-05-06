@@ -542,7 +542,44 @@ public:
         bool is_ssd  = false;
         bool is_nvme = false;
 
-        HANDLE hDisk = CreateFileA("\\\\.\\PhysicalDrive0", 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        /*
+         * BUG FIX #4 — PhysicalDrive0 hardcode
+         * ----------------------------------------
+         * Always querying PhysicalDrive0 is wrong when the OS lives on
+         * a different disk (e.g. NVMe on Drive1, SATA data on Drive0).
+         *
+         * Fix: open the C: volume, call IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS
+         * to learn which physical disk number backs it, then open that disk.
+         */
+        DWORD physDriveNumber = 0;   /* fallback */
+        {
+            HANDLE hVol = CreateFileA("\\\\.\\C:",
+                                      0,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                      nullptr, OPEN_EXISTING, 0, nullptr);
+            if (hVol != INVALID_HANDLE_VALUE) {
+                alignas(VOLUME_DISK_EXTENTS)
+                char extBuf[sizeof(VOLUME_DISK_EXTENTS) + 3 * sizeof(DISK_EXTENT)]{};
+                DWORD extBytes = 0;
+                if (DeviceIoControl(hVol, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                                    nullptr, 0,
+                                    extBuf, sizeof(extBuf),
+                                    &extBytes, nullptr))
+                {
+                    auto* vde = reinterpret_cast<VOLUME_DISK_EXTENTS*>(extBuf);
+                    if (vde->NumberOfDiskExtents > 0)
+                        physDriveNumber = vde->Extents[0].DiskNumber;
+                }
+                CloseHandle(hVol);
+            }
+        }
+
+        char drivePath[32]{};
+        snprintf(drivePath, sizeof(drivePath), "\\\\.\\PhysicalDrive%lu", physDriveNumber);
+
+        HANDLE hDisk = CreateFileA(drivePath, 0,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   nullptr, OPEN_EXISTING, 0, nullptr);
         if (hDisk != INVALID_HANDLE_VALUE) {
             DWORD bytes_returned = 0;
             STORAGE_PROPERTY_QUERY        spq_seek{};
