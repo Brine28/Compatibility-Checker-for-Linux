@@ -83,6 +83,18 @@ typedef struct _MSR_READ_CONTEXT {
     UINT64   result;
     BOOLEAN  valid;
     KEVENT   done_event;
+    /*
+     * BUG FIX #3 — KDPC must not live on the stack
+     * -----------------------------------------------
+     * On a DPC timeout the IOCTL handler returns and its stack frame is
+     * torn down.  If the DPC fires late it will write into the stale KDPC
+     * struct on the dead stack page → guaranteed BugCheck (stack corrupt /
+     * pool corrupt depending on guard pages).
+     *
+     * Moving KDPC here keeps it alive in NonPagedPool alongside the rest
+     * of the context; the intentional leak on timeout covers this field too.
+     */
+    KDPC     dpc;
 } MSR_READ_CONTEXT, *PMSR_READ_CONTEXT;
 
 static VOID LccMsrDpcRoutine(PKDPC Dpc, PVOID Context,
@@ -541,14 +553,13 @@ LccHandleGetCpuMsr(WDFREQUEST Request)
         LccMsrDpcRoutine(NULL, ctx, NULL, NULL);
     } else {
         /* Schedule DPC on the target logical processor */
-        KDPC  dpc;
-        KeInitializeDpc(&dpc, LccMsrDpcRoutine, ctx);
-        KeSetTargetProcessorDpcEx(&dpc,
+        KeInitializeDpc(&ctx->dpc, LccMsrDpcRoutine, ctx);
+        KeSetTargetProcessorDpcEx(&ctx->dpc,
             &(PROCESSOR_NUMBER){ 0,
                                   (UCHAR)in->cpu_index,
                                   0 });
-        KeSetImportanceDpc(&dpc, HighImportance);
-        KeInsertQueueDpc(&dpc, NULL, NULL);
+        KeSetImportanceDpc(&ctx->dpc, HighImportance);
+        KeInsertQueueDpc(&ctx->dpc, NULL, NULL);
 
         /* Wait for the DPC to signal completion (5-second safety timeout) */
         LARGE_INTEGER timeout;
@@ -734,7 +745,11 @@ LccHandleGetAcpiInfo(WDFREQUEST Request)
             ZwQuerySystemInformation(SystemFirmwareTableInformation,
                                      hdrInfo, hdrFetchSize, &fetchLen);
 
-        /* STATUS_BUFFER_TOO_SMALL is fine — we got the header */
+        /*
+         * STATUS_BUFFER_TOO_SMALL is expected when the full table is larger
+         * than our 64-byte header buffer — that is intentional.
+         * Any other failure means no data was written; skip this table.
+         */
         if (!NT_SUCCESS(fetchStatus) &&
             fetchStatus != STATUS_BUFFER_TOO_SMALL)
         {
@@ -742,9 +757,22 @@ LccHandleGetAcpiInfo(WDFREQUEST Request)
             continue;
         }
 
-        /* ACPI common header: Signature[4] Length[4] Revision[1]
-           Checksum[1] OEMID[6] OEMTableID[8] OEMRevision[4] … */
-        if (hdrInfo->TableBufferLength < 28) continue;
+        /*
+         * BUG FIX #6 — wrong field used to validate available data
+         * ----------------------------------------------------------
+         * hdrInfo->TableBufferLength is what WE SET (64), not what the
+         * kernel wrote back.  fetchLen (ReturnLength from ZwQuerySystemInfo)
+         * tells us how many bytes the kernel actually filled in the whole
+         * SYSTEM_FIRMWARE_TABLE_INFORMATION struct including the header.
+         * Subtract the fixed header size to get bytes in TableBuffer[].
+         *
+         * When STATUS_BUFFER_TOO_SMALL is returned the kernel has still
+         * filled in as many bytes as fit, so dataAvail can be non-zero.
+         */
+        ULONG dataAvail = (fetchLen > (ULONG)sizeof(SYSTEM_FIRMWARE_TABLE_INFORMATION))
+                          ? fetchLen - (ULONG)sizeof(SYSTEM_FIRMWARE_TABLE_INFORMATION)
+                          : 0;
+        if (dataAvail < 28) continue;
 
         PUCHAR hdr = hdrInfo->TableBuffer;
 
@@ -767,7 +795,7 @@ LccHandleGetAcpiInfo(WDFREQUEST Request)
                 rec->revision);
     }
 
-    if (hdrInfo) ExFreePoolWithTag(hdrInfo,  LCC_POOL_TAG);
+    ExFreePoolWithTag(hdrInfo, LCC_POOL_TAG);  /* always non-NULL here; null path returned early */
     ExFreePoolWithTag(enumInfo, LCC_POOL_TAG);
 
     out->xsdt_present  = xsdtSeen;
