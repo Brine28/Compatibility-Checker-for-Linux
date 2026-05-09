@@ -15,12 +15,13 @@
  * Derleme (MSVC):
  * cl linux_compat_checker.cpp /Fe:linux_compat_checker.exe /EHsc /std:c++latest /link advapi32.lib setupapi.lib winhttp.lib
  */
-
+#define NOMINMAX
 #define _WIN32_WINNT 0x0A00   /* Windows 10+ */
 #define UNICODE
 #define _UNICODE
 
 #include <windows.h>
+#include <algorithm>
 #include <initguid.h>
 #include <setupapi.h>
 #include <devguid.h>
@@ -150,10 +151,11 @@ namespace Registry {
             return std::nullopt;
 
         char  buf[256]{};
-        DWORD type = REG_SZ;
+        DWORD type = 0;
         DWORD sz   = sizeof(buf);
         bool  ok   = (RegQueryValueExA(hk, value, nullptr, &type,
-                                       reinterpret_cast<LPBYTE>(buf), &sz) == ERROR_SUCCESS);
+                                       reinterpret_cast<LPBYTE>(buf), &sz) == ERROR_SUCCESS)
+                     && (type == REG_SZ || type == REG_EXPAND_SZ);
         RegCloseKey(hk);
         if (!ok) return std::nullopt;
 
