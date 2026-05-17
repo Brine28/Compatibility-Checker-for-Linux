@@ -472,8 +472,8 @@ public:
         GetSystemInfo(&si);
         const DWORD cores = si.dwNumberOfProcessors;
 
-        const bool is_intel = vendor.contains("GenuineIntel"); 
-        const bool is_amd   = vendor.contains("AuthenticAMD");
+        const bool is_intel = vendor.find("GenuineIntel") != std::string::npos;
+        const bool is_amd   = vendor.find("AuthenticAMD") != std::string::npos;
 
         CompatItem* itp = new_item(report);
         if (!itp) return;
@@ -636,7 +636,7 @@ class GpuAnalyzer : public Analyzer {
 public:
     void analyze(CompatReport& report) override {
         bool found = enumerate_devices(&GUID_DEVCLASS_DISPLAY, [&](std::string_view name, std::string_view hw_id) {
-            auto has = [&](std::string_view s) { return name.contains(s); };
+            auto has = [&](std::string_view s) { return name.find(s) != std::string_view::npos; };
 
             CompatItem* itp = new_item(report);
             if (!itp) return;
@@ -690,7 +690,7 @@ class NetworkAnalyzer : public Analyzer {
 public:
     void analyze(CompatReport& report) override {
         bool found = enumerate_devices(&GUID_DEVCLASS_NET, [&](std::string_view name, std::string_view hw_id) {
-            auto has = [&](std::string_view s) { return name.contains(s); };
+            auto has = [&](std::string_view s) { return name.find(s) != std::string_view::npos; };
 
             if (has("Microsoft") || has("WAN Miniport") || has("Bluetooth") || has("Loopback")) return;
 
@@ -751,7 +751,7 @@ class AudioAnalyzer : public Analyzer {
 public:
     void analyze(CompatReport& report) override {
         bool found = enumerate_devices(&GUID_DEVCLASS_MEDIA, [&](std::string_view name, std::string_view hw_id) {
-            auto has = [&](std::string_view s) { return name.contains(s); };
+            auto has = [&](std::string_view s) { return name.find(s) != std::string_view::npos; };
 
             if (has("Virtual") || has("Microsoft")) return;
 
@@ -1083,7 +1083,7 @@ struct StepMeta {
     bool        online_only = false;
 };
 
-inline constexpr std::array<StepMeta, 14> PIPELINE_STEPS{{
+inline constexpr std::array<StepMeta, 13> PIPELINE_STEPS{{
     { "Adım  2/14: İşlemci Analiz Ediliyor        ",  8, 30, false },
     { "Adım  3/14: Bellek (RAM) Analiz Ediliyor   ",  6, 25, false },
     { "Adım  4/14: Disk ve Depolama Analizi       ",  7, 35, false },
