@@ -152,8 +152,8 @@ LccEvtDeviceAdd(
     WDFDEVICE             device;
     WDFQUEUE              queue;
     WDF_IO_QUEUE_CONFIG   queueConfig;
-    UNICODE_STRING        deviceName;
     UNICODE_STRING        symlinkName;
+    UNICODE_STRING        deviceName;
 
     UNREFERENCED_PARAMETER(Driver);
 
@@ -183,7 +183,17 @@ LccEvtDeviceAdd(
     WdfDeviceInitSetCharacteristics(DeviceInit,
                                     FILE_DEVICE_SECURE_OPEN, TRUE);
 
-    /* ── 2. Create the WDF device object */
+    /* ── 2. Assign NT device name before WdfDeviceCreate */
+    RtlInitUnicodeString(&deviceName,  LCC_DEVICE_NAME);
+    RtlInitUnicodeString(&symlinkName, LCC_SYMLINK_NAME);
+
+    status = WdfDeviceInitAssignName(DeviceInit, &deviceName);
+    if (!NT_SUCCESS(status)) {
+        LCC_LOG("WdfDeviceInitAssignName failed: 0x%08X", status);
+        return status;
+    }
+
+    /* ── 3. Create the WDF device object */
     status = WdfDeviceCreate(&DeviceInit,
                              WDF_NO_OBJECT_ATTRIBUTES,
                              &device);
@@ -192,17 +202,14 @@ LccEvtDeviceAdd(
         return status;
     }
 
-    /* ── 3. Create a NT device name so we can make a symbolic link */
-    RtlInitUnicodeString(&deviceName,  LCC_DEVICE_NAME);
-    RtlInitUnicodeString(&symlinkName, LCC_SYMLINK_NAME);
-
+    /* ── 4. Create the DosDevices symbolic link */
     status = WdfDeviceCreateSymbolicLink(device, &symlinkName);
     if (!NT_SUCCESS(status)) {
         LCC_LOG("WdfDeviceCreateSymbolicLink failed: 0x%08X", status);
         return status;
     }
 
-    /* ── 4. Sequential I/O queue — serialises IOCTL calls */
+    /* ── 5. Sequential I/O queue — serialises IOCTL calls */
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig,
                                            WdfIoQueueDispatchSequential);
     queueConfig.EvtIoDeviceControl = LccEvtIoDeviceControl;
