@@ -1,0 +1,63 @@
+; lcc_driver.inf
+; ──────────────────────────────────────────────────────────────────
+; INF for Linux Compat Checker kernel-mode driver
+; Windows 10 / 11 x64
+; ──────────────────────────────────────────────────────────────────
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+DriverVer   = 05/05/2026,1.0.0.0
+CatalogFile = lcc_driver.cat
+PnpLockDown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12     ; %SystemRoot%\System32\drivers
+LccDriver_CopyFiles = 12
+
+; ──────────────────────────────────────────────────────────────────
+; Install sections
+; ──────────────────────────────────────────────────────────────────
+[DefaultInstall.NTAMD64]
+CopyFiles = LccDriver_CopyFiles
+
+[DefaultInstall.NTAMD64.Services]
+AddService = LccDriver, 0x00000002, LccDriver_Service
+
+[DefaultUninstall.NTAMD64]
+LegacyUninstall=1
+
+[DefaultUninstall.NTAMD64.Services]
+DelService = LccDriver, 0x00000200    ; SPSVCINST_STOPSERVICE
+
+; ──────────────────────────────────────────────────────────────────
+; Service definition
+; ──────────────────────────────────────────────────────────────────
+[LccDriver_Service]
+DisplayName    = %ServiceDescription%
+ServiceType    = 1                    ; SERVICE_KERNEL_DRIVER
+StartType      = 3                    ; SERVICE_DEMAND_START
+ErrorControl   = 1                    ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\lcc_driver.sys
+
+; ──────────────────────────────────────────────────────────────────
+; File copy
+; ──────────────────────────────────────────────────────────────────
+[LccDriver_CopyFiles]
+lcc_driver.sys, lcc_driver.sys
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+lcc_driver.sys = 1
+
+; ──────────────────────────────────────────────────────────────────
+; Strings
+; ──────────────────────────────────────────────────────────────────
+[Strings]
+ManufacturerName   = "LinuxCompatChecker"
+ServiceDescription = "Linux Compat Checker Hardware Access Driver"
+DiskName           = "LccDriver Installation Disk"

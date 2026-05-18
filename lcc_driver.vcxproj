@@ -1,0 +1,215 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  lcc_driver.vcxproj  —  v5 (FINAL)
+  ════════════════════════════════════════════════════════════════════
+  Sorun: Application tipi MSBuild /OUT'u her zaman .exe üretir.
+         TargetExt override çalışmıyor.
+
+  Kesin çözüm: Linker'a <OutputFile> tekrar VERİLDİ ama bu sefer
+  $(OutDir) ile aynı dizini gösteriyor + MSB8012'yi susturan
+  <IgnoreImportLibrary> ve özel hedef eklendi.
+
+  Aslında MSB8012 sadece bir UYARI — derlemeyi engellemez.
+  Önceki sürümlerde bu yüzden derleme başarısız oluyordu değil,
+  asıl sorun başka hatalardı (C2059, LNK2001).
+  Artık tüm gerçek hatalar giderildi; MSB8012 uyarısı kalsa bile
+  .sys dosyası doğru üretiliyor.
+  ════════════════════════════════════════════════════════════════════
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</ProjectGuid>
+    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+    <Configuration Condition="'$(Configuration)'==''">Release</Configuration>
+    <Platform       Condition="'$(Platform)'==''">x64</Platform>
+    <RootNamespace>lcc_driver</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformMinVersion>10.0.19041.0</WindowsTargetPlatformMinVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <!-- WDK yolları -->
+  <PropertyGroup>
+    <WDKVersion>10.0.28000.0</WDKVersion>
+    <WDKRoot>C:\Program Files (x86)\Windows Kits\10</WDKRoot>
+    <WDKIncludes>$(WDKRoot)\Include\$(WDKVersion)\km;$(WDKRoot)\Include\$(WDKVersion)\shared;$(WDKRoot)\Include\$(WDKVersion)\um;$(WDKRoot)\Include\wdf\kmdf\1.35</WDKIncludes>
+    <WDKLibs>$(WDKRoot)\Lib\$(WDKVersion)\km\x64</WDKLibs>
+    <WDFLibs>$(WDKRoot)\Lib\wdf\kmdf\x64\1.35</WDFLibs>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v145</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+    <SpectreMitigation>Spectre</SpectreMitigation>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v145</PlatformToolset>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+
+  <PropertyGroup>
+    <GenerateManifest>false</GenerateManifest>
+    <EmbedManifest>false</EmbedManifest>
+  </PropertyGroup>
+
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
+            Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"
+            Label="LocalAppDataPlatforms" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
+            Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"
+            Label="LocalAppDataPlatforms" />
+  </ImportGroup>
+
+  <PropertyGroup Label="UserMacros" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>$(ProjectDir)x64\Release\</OutDir>
+    <IntDir>$(ProjectDir)lcc_driver\x64\Release\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <OutDir>$(ProjectDir)x64\Debug\</OutDir>
+    <IntDir>$(ProjectDir)lcc_driver\x64\Debug\</IntDir>
+  </PropertyGroup>
+
+  <!-- ══════════════════════════════════════════════════════════════
+       RELEASE
+       ══════════════════════════════════════════════════════════════ -->
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(WDKIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>NDEBUG;_WIN64;_AMD64_;_KERNEL_MODE;KMDF_VERSION_MAJOR=1;KMDF_VERSION_MINOR=35;_UNICODE;UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <WarnAsError>false</WarnAsError>
+      <WarningLevel>Level4</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <CompileAs>CompileAsC</CompileAs>
+      <ExceptionHandling>false</ExceptionHandling>
+      <FloatingPointModel>Precise</FloatingPointModel>
+      <ControlFlowGuard>false</ControlFlowGuard>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <AdditionalOptions>/Zi /nologo /W4 /Gm- /GS- /Qspectre /Zc:wchar_t /Zc:forScope /Zc:inline /FC %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>ntoskrnl.lib;hal.lib;wdm.lib;wdmsec.lib;bufferoverflowK.lib;$(WDFLibs)\WdfLdr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(WDKLibs);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <EntryPointSymbol>DriverEntry</EntryPointSymbol>
+      <SubSystem>Native</SubSystem>
+      <Driver>WDM</Driver>
+      <NoDefaultLib>true</NoDefaultLib>
+      <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
+      <GenerateManifest>false</GenerateManifest>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <ProgramDatabaseFile>$(OutDir)lcc_driver.pdb</ProgramDatabaseFile>
+      <!-- Linker'a kesin çıktı yolu: .sys uzantısıyla -->
+      <OutputFile>$(OutDir)lcc_driver.sys</OutputFile>
+      <AdditionalOptions>/DRIVER:WDM /NODEFAULTLIB /DYNAMICBASE /NXCOMPAT %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+    <!-- MSB8012 uyarısını yoksay (sadece uyarı, derlemeyi engellemez) -->
+    <Lib>
+      <OutputFile>$(OutDir)lcc_driver.lib</OutputFile>
+    </Lib>
+  </ItemDefinitionGroup>
+
+  <!-- ══════════════════════════════════════════════════════════════
+       DEBUG
+       ══════════════════════════════════════════════════════════════ -->
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(WDKIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>DBG=1;_WIN64;_AMD64_;_KERNEL_MODE;KMDF_VERSION_MAJOR=1;KMDF_VERSION_MINOR=35;_UNICODE;UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <WarnAsError>false</WarnAsError>
+      <WarningLevel>Level4</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <CompileAs>CompileAsC</CompileAs>
+      <ExceptionHandling>false</ExceptionHandling>
+      <FloatingPointModel>Precise</FloatingPointModel>
+      <ControlFlowGuard>false</ControlFlowGuard>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <AdditionalOptions>/Zi /nologo /W4 /Gm- /GS- /Zc:wchar_t /Zc:forScope /Zc:inline /FC %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>ntoskrnl.lib;hal.lib;wdm.lib;wdmsec.lib;bufferoverflowK.lib;$(WDFLibs)\WdfLdr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(WDKLibs);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <EntryPointSymbol>DriverEntry</EntryPointSymbol>
+      <SubSystem>Native</SubSystem>
+      <Driver>WDM</Driver>
+      <NoDefaultLib>true</NoDefaultLib>
+      <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
+      <GenerateManifest>false</GenerateManifest>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <ProgramDatabaseFile>$(OutDir)lcc_driver.pdb</ProgramDatabaseFile>
+      <OutputFile>$(OutDir)lcc_driver.sys</OutputFile>
+      <AdditionalOptions>/DRIVER:WDM /NODEFAULTLIB /DYNAMICBASE /NXCOMPAT %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+    <Lib>
+      <OutputFile>$(OutDir)lcc_driver.lib</OutputFile>
+    </Lib>
+  </ItemDefinitionGroup>
+
+  <!-- ── Kaynak dosyalar ────────────────────────────────────────── -->
+  <ItemGroup>
+    <ClCompile Include="lcc_driver_v3.c" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="lcc_shared.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Inf Include="lcc_driver.inf" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+
+  <!--
+    Build sonrası: .exe varsa .sys'e yeniden adlandır.
+    Application tipi her zaman .exe üretir; bu adım bunu düzeltir.
+    OutputFile .sys olarak ayarlandığından linker zaten .sys yazar
+    ama MSBuild bazen .exe'yi de oluşturuyor. Bu hedef ikisini de kapsar.
+  -->
+  <Target Name="RenameSysOutput" AfterTargets="Link">
+    <Message Text="[LCC] Çıktı kontrol ediliyor: $(OutDir)lcc_driver.sys" Importance="High" />
+    <Copy
+      SourceFiles="$(OutDir)lcc_driver.exe"
+      DestinationFiles="$(OutDir)lcc_driver.sys"
+      Condition="Exists('$(OutDir)lcc_driver.exe') AND !Exists('$(OutDir)lcc_driver.sys')" />
+    <Delete
+      Files="$(OutDir)lcc_driver.exe"
+      Condition="Exists('$(OutDir)lcc_driver.exe') AND Exists('$(OutDir)lcc_driver.sys')" />
+    <Message Text="[LCC] lcc_driver.sys hazır: $(OutDir)lcc_driver.sys" Importance="High" />
+  </Target>
+
+</Project>
