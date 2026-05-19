@@ -11,8 +11,7 @@ This repository contains a user-mode checker, a kernel-mode driver interface for
 - `lcc_shared.h` — shared IOCTL and data structure definitions
 - `lcc_driver.inf` — driver installation manifest
 - `lcc_driver.vcxproj` — Visual Studio driver project
-- `x64/Release/lcc_driver.sys` — compiled driver output (if built)
-- `lcc_driver/` — additional driver packaging and artifact files
+
 
 ## What this project does
 
