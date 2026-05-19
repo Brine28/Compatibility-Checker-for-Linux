@@ -1,34 +1,36 @@
 # 🐧 Linux Compatibility Checker for Windows
 
-A Windows terminal utility that scans system hardware and firmware and estimates how well the machine will work with Linux.
+A Windows compatibility utility for testing hardware and firmware readiness before migrating a PC to Linux.
 
-This project includes both:
-- `linux_compat_checker.cpp` — a C++ user-mode application that gathers system information and computes compatibility scores
-- `driver/` — a kernel-mode driver project that exposes low-level PCI, MSR, and ACPI data to the application via IOCTL
+This repository includes:
+- `driver/linux_compat_checker.cpp` — the user-mode application source
+- `driver/lcc_driver_v3.c` — the kernel-mode driver source used for low-level hardware access
+- `driver/lcc_shared.h` — shared IOCTL definitions and data structures
+- `driver/lcc_driver.inf` / `driver/lcc_driver.vcxproj` — driver install manifest and Visual Studio project
+- `driver/lcc_driver/` — driver build artifacts and packaging files
 
 ## What it does
 
-The compatibility checker inspects Windows system configuration and hardware components to identify possible Linux migration issues.
-It reports compatibility using a 4-level score and provides recommendations for common Linux-related compatibility concerns.
+The checker gathers system details on Windows and evaluates Linux compatibility across CPU, storage, firmware, graphics, virtualization, and system firmware.
+It reports a four-level compatibility score, component-by-component findings, and practical recommendations.
 
-## Key Features
+## Key features
 
-- Hardware compatibility scoring for CPU, memory, storage, GPU, network, audio, firmware, Secure Boot, TPM, power, and virtualization
-- PCI device enumeration via a kernel-mode driver
-- Low-level MSR reads for CPU feature inspection
-- ACPI table enumeration for firmware and platform checks
-- Optional kernel.org query for latest Linux stable kernel version
-- ANSI color output for readable terminal reporting on Windows 10+
-- Local, read-only analysis with no hidden remote telemetry
+- Compatibility scoring for CPU, storage, GPU, network, audio, firmware, Secure Boot, TPM, virtualization, and more
+- Optional PCI/MSR/ACPI inspection using a kernel-mode driver
+- ACPI table enumeration and firmware analysis
+- Optional online kernel.org lookup for the latest stable Linux kernel
+- ANSI-colored Windows terminal output in English for readability
+- Fully local analysis with no hidden remote telemetry
 
-## Project Structure
+## Current project structure
 
-- `linux_compat_checker.cpp` — main application source
-- `driver/lcc_driver.c` — KMDF kernel-mode driver implementation
-- `driver/lcc_shared.h` — shared IOCTL definitions and data structures used by both user-mode and driver projects
-- `driver/lcc_driver.inf` / `driver/lcc_driver.vcxproj` — driver install manifest and driver build project
+- `driver/linux_compat_checker.cpp` — main application source
+- `driver/lcc_driver_v3.c` — driver source code
+- `driver/lcc_shared.h` — shared IOCTL header
+- `driver/lcc_driver.inf` / `driver/lcc_driver.vcxproj` — driver manifest and build project
 
-## Compatibility Score Legend
+## Compatibility score legend
 
 | Score | Meaning |
 |------:|---------|
@@ -37,85 +39,69 @@ It reports compatibility using a 4-level score and provides recommendations for 
 | `2`   | Possibly incompatible; review carefully |
 | `3`   | Incompatible; likely Linux migration issues |
 
-## Build Instructions
+## Build instructions
 
 ### Requirements
 
 - Windows 10 or later
-- C++ compiler with C++23 support
-- Windows SDK and libraries for `advapi32`, `setupapi`, and `winhttp`
-- (Driver only) Windows Driver Kit (WDK) and Visual Studio to build the KMDF driver
+- MSVC or another C++ compiler with C++23 support
+- Windows SDK libraries: `advapi32`, `setupapi`, `winhttp`
+- Windows Driver Kit (WDK) and Visual Studio to build the driver
 
 ### Build the user-mode application
 
-#### MSVC
+Open a Developer Command Prompt and run from the repository root:
 
 ```batch
+cd driver
 cl linux_compat_checker.cpp /Fe:linux_compat_checker.exe /EHsc /std:c++latest /link advapi32.lib setupapi.lib winhttp.lib
-```
-
-#### GCC / MinGW-w64
-
-```bash
-g++ linux_compat_checker.cpp -o linux_compat_checker.exe -std=c++23 -ladvapi32 -lsetupapi -lwinhttp
 ```
 
 ### Build the driver
 
-The driver is a KMDF project intended for x64 Windows.
-Use Visual Studio with WDK support and open `driver/lcc_driver.vcxproj`.
-
-The driver exposes these IOCTL operations:
-- `IOCTL_LCC_GET_VERSION` — version handshake
-- `IOCTL_LCC_GET_PCI_DEVICES` — raw PCI bus scan
-- `IOCTL_LCC_GET_CPU_MSR` — read a CPU Model-Specific Register
-- `IOCTL_LCC_GET_ACPI_INFO` — enumerate ACPI tables from RSDT/XSDT
+Open `driver/lcc_driver.vcxproj` in Visual Studio with WDK support.
+Build as an x64 driver and install it with proper code signing or Windows test signing.
 
 ### Driver installation notes
 
-This driver must be installed with proper signing or Windows test-signing enabled.
 For test installations, enable test signing and reboot:
 
 ```batch
 bcdedit /set testsigning on
 ```
 
-Then load the driver using Windows service or driver install tools.
+Then install the driver using standard Windows driver installation workflows.
 
 ## Usage
 
-1. Build `linux_compat_checker.exe`
-2. Ensure the optional kernel-mode driver is installed and running if you want the lowest-level PCI/MSR/ACPI checks
-3. Run the executable from an elevated terminal for best coverage:
+Run the checker from an elevated terminal for the best results.
 
 ```batch
+cd driver
 linux_compat_checker.exe
 ```
 
-The tool prints a compatibility report with component scores and recommendations.
-
 ## Output
 
-The application produces:
-- a list of compatibility items grouped by component
-- a color-coded score for each item
-- a computed overall compatibility percentage
-- diagnostic details for hardware and firmware checks
-- optional online kernel version lookup if internet access is available
+The tool generates:
+- compatibility findings grouped by component
+- color-coded scores for each item
+- an overall compatibility score
+- recommendations for Linux migration
+- optional online kernel version lookup if available
 
 ## Security and privacy
 
-- All analysis is performed locally on the host system
-- The application is read-only and does not modify disk or firmware settings
-- No telemetry or remote upload of system data is included
-- Online kernel version lookups are optional and limited to `kernel.org`
+- Analysis runs locally on the host system
+- No disk or firmware changes are made by the tool
+- No telemetry is sent without user consent
+- Online kernel lookups are optional
 
 ## Notes
 
-- The project targets Windows 10+ and uses C++23 features such as `std::format`
-- The application uses Windows APIs directly and links against `advapi32`, `setupapi`, and `winhttp`
-- The driver is intended only for diagnostic use and must be run with administrator privileges
+- The application is designed for Windows 10+ and uses modern C++ features.
+- The driver is intended for diagnostic use only and requires administrator rights.
 
 ## License
 
-This repository is provided under the terms of the existing `LICENSE` file.
+This repository is distributed under the terms of the existing `LICENSE` file.
