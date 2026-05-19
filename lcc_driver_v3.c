@@ -331,11 +331,17 @@ LccPciReadDword(UINT8 bus, UINT8 dev, UINT8 fn, UINT8 reg)
 {
     ULONG address = LccPciMakeAddress(bus, dev, fn, reg);
     KIRQL oldIrql;
-    ULONG value;
+    ULONG value = 0xFFFFFFFFUL;  /* varsayılan: boş/hata */
 
+    /* [FIX] Port I/O bazı VM/hypervisor ortamlarında exception fırlatabilir.
+     * __try/__except ile sararak BSOD yerine "slot boş" döndürüyoruz. */
     KeAcquireSpinLock(&g_PciPortLock, &oldIrql);
-    WRITE_PORT_ULONG((PULONG)(ULONG_PTR)0xCF8, address);
-    value = READ_PORT_ULONG((PULONG)(ULONG_PTR)0xCFC);
+    __try {
+        WRITE_PORT_ULONG((PULONG)(ULONG_PTR)0xCF8, address);
+        value = READ_PORT_ULONG((PULONG)(ULONG_PTR)0xCFC);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        value = 0xFFFFFFFFUL;
+    }
     KeReleaseSpinLock(&g_PciPortLock, oldIrql);
 
     return value;
@@ -540,8 +546,10 @@ LccHandleGetCpuMsr(PIRP Irp, PIO_STACK_LOCATION Stack)
              *            DPC'nin done_event'i set etmesini garantile.
              */
             if (!KeRemoveQueueDpc(&ctx->dpc)) {
-                /* DPC çalışıyor — event'i sıfırla, tamamlanmasını bekle */
-                KeClearEvent(&ctx->done_event);
+                /* DPC zaten çalışıyor veya tamamlandı.
+                 * Direkt bekle — DPC done_event'i set edecek.
+                 * Not: KeClearEvent burada YANLIŞ olur; DPC zaten
+                 * set etmişse sıfırlayıp sonsuz bekleriz. */
                 KeWaitForSingleObject(&ctx->done_event,
                                       Executive, KernelMode, FALSE, NULL);
             }
