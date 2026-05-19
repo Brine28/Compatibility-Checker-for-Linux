@@ -1,34 +1,42 @@
-# 🐧 Linux Compatibility Checker for Windows
+# Linux Compatibility Checker for Windows
 
-A Windows compatibility utility for testing hardware and firmware readiness before migrating a PC to Linux.
+A Windows-based diagnostic utility that evaluates a PC's readiness for migration to Linux.
 
-This repository includes:
-- `driver/linux_compat_checker.cpp` — the user-mode application source
-- `driver/lcc_driver_v3.c` — the kernel-mode driver source used for low-level hardware access
-- `driver/lcc_shared.h` — shared IOCTL definitions and data structures
-- `driver/lcc_driver.inf` / `driver/lcc_driver.vcxproj` — driver install manifest and Visual Studio project
-- `driver/lcc_driver/` — driver build artifacts and packaging files
+This repository contains the Windows compatibility checker application, optional kernel-mode driver code for low-level hardware access, and the driver installation project.
 
-## What it does
+## Repository contents
 
-The checker gathers system details on Windows and evaluates Linux compatibility across CPU, storage, firmware, graphics, virtualization, and system firmware.
-It reports a four-level compatibility score, component-by-component findings, and practical recommendations.
+- `linux_compat_checker.cpp` — main Windows user-mode application source
+- `lcc_driver_v3.c` — kernel-mode driver source used for optional low-level hardware and ACPI access
+- `lcc_shared.h` — shared IOCTL definitions and data structures used by both application and driver
+- `lcc_driver.inf` — driver installation manifest
+- `lcc_driver.vcxproj` — Visual Studio project for building the driver
+- `lcc_driver/` — driver build artifacts and packaging output
+- `x64/Release/` — compiled runtime driver file `lcc_driver.sys`
+
+## What this tool does
+
+The Linux Compatibility Checker analyzes Windows hardware and firmware to help determine whether a PC is likely to work well under Linux.
+It gathers system information and checks compatibility for:
+
+- CPU and instruction set support
+- Storage controllers and disk configuration
+- Graphics and display capabilities
+- Firmware type and Secure Boot state
+- TPM presence and firmware support
+- Virtualization support and platform readiness
+- ACPI tables and low-level platform data (driver-assisted)
+
+The tool reports per-component compatibility statuses and provides a concise overall readiness score.
 
 ## Key features
 
-- Compatibility scoring for CPU, storage, GPU, network, audio, firmware, Secure Boot, TPM, virtualization, and more
-- Optional PCI/MSR/ACPI inspection using a kernel-mode driver
-- ACPI table enumeration and firmware analysis
-- Optional online kernel.org lookup for the latest stable Linux kernel
-- ANSI-colored Windows terminal output in English for readability
-- Fully local analysis with no hidden remote telemetry
-
-## Current project structure
-
-- `driver/linux_compat_checker.cpp` — main application source
-- `driver/lcc_driver_v3.c` — driver source code
-- `driver/lcc_shared.h` — shared IOCTL header
-- `driver/lcc_driver.inf` / `driver/lcc_driver.vcxproj` — driver manifest and build project
+- Local Windows compatibility analysis with no hidden telemetry
+- Component-level scoring and human-readable recommendations
+- Optional low-level diagnostics through a kernel-mode driver
+- ACPI table enumeration and firmware inspection support
+- ANSI-colored output in Windows terminal for readability
+- Supports manual builds and driver diagnostics for advanced hardware checks
 
 ## Compatibility score legend
 
@@ -39,68 +47,98 @@ It reports a four-level compatibility score, component-by-component findings, an
 | `2`   | Possibly incompatible; review carefully |
 | `3`   | Incompatible; likely Linux migration issues |
 
-## Build instructions
+## Prerequisites
 
-### Requirements
+Before building the project, ensure you have:
 
 - Windows 10 or later
-- MSVC or another C++ compiler with C++23 support
-- Windows SDK libraries: `advapi32`, `setupapi`, `winhttp`
-- Windows Driver Kit (WDK) and Visual Studio to build the driver
+- Visual Studio with C++ Desktop Development workload
+- Windows SDK installed
+- Windows Driver Kit (WDK) for building the driver
+- Elevated command prompt or administrator privileges for driver installation and runtime diagnostics
 
-### Build the user-mode application
+## Build instructions
 
-Open a Developer Command Prompt and run from the repository root:
+### 1. Build the user-mode application
+
+Open a Visual Studio Developer Command Prompt and run:
 
 ```batch
-cd driver
+cd c:\Users\Muhammed\Desktop\Compatibility-Checker-for-Linux\driver
 cl linux_compat_checker.cpp /Fe:linux_compat_checker.exe /EHsc /std:c++latest /link advapi32.lib setupapi.lib winhttp.lib
 ```
 
-### Build the driver
+This produces `linux_compat_checker.exe` in the `driver` directory.
 
-Open `driver/lcc_driver.vcxproj` in Visual Studio with WDK support.
-Build as an x64 driver and install it with proper code signing or Windows test signing.
+### 2. Build the kernel-mode driver (optional)
 
-### Driver installation notes
+The kernel-mode driver is optional and provides deeper hardware access when installed.
 
-For test installations, enable test signing and reboot:
+1. Open `lcc_driver.vcxproj` in Visual Studio.
+2. Select the x64 platform.
+3. Set the configuration to `Release`.
+4. Build the project.
+
+If the driver build succeeds, the compiled `lcc_driver.sys` file appears in the `x64\Release` output folder.
+
+## Driver installation
+
+The driver is intended for diagnostic use only. Installing unsigned drivers on Windows requires test signing mode.
+
+### Enable test signing mode
+
+From an elevated command prompt, run:
 
 ```batch
 bcdedit /set testsigning on
 ```
 
-Then install the driver using standard Windows driver installation workflows.
+Restart Windows after enabling test signing.
+
+### Install the driver
+
+Use the standard Windows driver installation process for `.inf` files, or install the driver manually with a driver installation utility.
+
+> Note: Installing kernel drivers requires administrator access. Do not install drivers on systems where you cannot safely recover from driver-related issues.
 
 ## Usage
 
-Run the checker from an elevated terminal for the best results.
+Run the checker from an elevated terminal to maximize diagnostic coverage:
 
 ```batch
-cd driver
+cd c:\Users\Muhammed\Desktop\Compatibility-Checker-for-Linux\driver
 linux_compat_checker.exe
 ```
 
-## Output
+The application prints a detailed compatibility report to the terminal.
 
-The tool generates:
-- compatibility findings grouped by component
-- color-coded scores for each item
-- an overall compatibility score
-- recommendations for Linux migration
-- optional online kernel version lookup if available
+## Expected output
+
+The tool produces:
+
+- A compatibility score per hardware and firmware component
+- An overall Linux readiness score
+- Component findings and warnings
+- Practical recommendations and next steps
+- Optional online kernel.org version lookup if the system has internet access
+
+## Troubleshooting
+
+- If the application cannot access low-level data, run it as administrator.
+- If driver loading fails, verify that test signing is enabled and the driver is built for x64.
+- If Visual Studio cannot build the driver, confirm that the Windows Driver Kit is installed.
 
 ## Security and privacy
 
-- Analysis runs locally on the host system
-- No disk or firmware changes are made by the tool
-- No telemetry is sent without user consent
-- Online kernel lookups are optional
+- The compatibility checker runs locally and does not modify firmware or persistent disk data.
+- No telemetry is collected or transmitted without explicit user action.
+- Online checks are optional and do not affect the local analysis flow.
 
 ## Notes
 
-- The application is designed for Windows 10+ and uses modern C++ features.
-- The driver is intended for diagnostic use only and requires administrator rights.
+- This project is designed for Windows diagnostics prior to Linux migration.
+- The kernel-mode driver is for advanced diagnostic access only and should be used carefully.
+- Use the latest Windows SDK and driver signing settings when building on modern Windows versions.
 
 ## License
 
