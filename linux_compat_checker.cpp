@@ -1,10 +1,12 @@
 /*
  * Windows 11 için Linux Çekirdeği Uyumluluk Denetleyicisi
  * =======================================================
- * Donanım ve sistem yapılandırmasını tarayarak Linux'a geçiş 
+ * Donanım ve sistem yapılandırmasını tarayarak Linux'a geçiş
  * uygunluğunu değerlendirir ve puanlanmış bir rapor üretir.
- * AYRICA: Donanım detaylarına Ring-0 erişimi sağlamak için
- * 'LccDriver' (lcc_driver.sys) çekirdek modu sürücüsüyle haberleşir!
+ *
+ * Bu sürüm hiçbir çekirdek modu (Ring-0) sürücüsü kullanmaz;
+ * tüm veriler standart, imzasız Win32 kullanıcı-modu API'leriyle
+ * toplanır (SetupAPI, WinHTTP, CPUID, GetDiskFreeSpaceEx vb.).
  *
  * Puanlar: 0=Tam Uyumlu | 1=Uyumlu (küçük sorunlar)
  * 2=Olası Uyumsuz | 3=Uyumsuz
@@ -27,7 +29,7 @@
 #include <devguid.h>
 #include <winhttp.h>
 #include <intrin.h>
-#include <winioctl.h>    /* DeviceIoControl için gerekli */
+#include <winioctl.h>    /* IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, IOCTL_STORAGE_QUERY_PROPERTY için */
 
 #include <cstdio>
 #include <cstring>
@@ -39,9 +41,6 @@
 #include <memory>
 #include <optional>
 #include <functional>
-
-/* SÜRÜCÜ BAŞLIK DOSYASI (Aynı dizinde bulunmalı) */
-#include "lcc_shared.h"
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "setupapi.lib")
@@ -72,9 +71,6 @@ inline constexpr std::string_view CAT_TPM    = "TPM";
 inline constexpr std::string_view CAT_POWER  = "Power / Battery";
 inline constexpr std::string_view CAT_VIRT   = "Virtualization";
 inline constexpr std::string_view CAT_ONLINE = "Online Data";
-inline constexpr std::string_view CAT_DRV_PCI= "Driver PCI Scan";
-inline constexpr std::string_view CAT_DRV_ACP= "Driver ACPI Read";
-inline constexpr std::string_view CAT_DRV_MSR= "Driver MSR Query";
 
 /* ─── Uyumluluk Puanı Seviyeleri ─── */
 enum class CompatScore : int {
@@ -195,7 +191,7 @@ namespace Console {
     inline void print_header() {
         printf("\n");
         printf("%s%s╔══════════════════════════════════════════════════════════════╗\n%s", CYAN, BOLD, RESET);
-        printf("%s%s║%s%s%s     🐧  Linux Compatibility Checker v2.1           %s%s║\n%s", CYAN, BOLD, RESET, BLUE, BOLD, CYAN, BOLD, RESET);
+        printf("%s%s║%s%s%s     🐧  Linux Compatibility Checker v2.2           %s%s║\n%s", CYAN, BOLD, RESET, BLUE, BOLD, CYAN, BOLD, RESET);
         printf("%s%s║%s%s     Windows 11 → Linux migration readiness report   %s%s║\n%s", CYAN, BOLD, RESET, DIM, CYAN, BOLD, RESET);
         printf("%s%s╚══════════════════════════════════════════════════════════════╝\n%s", CYAN, BOLD, RESET);
         printf("\n");
@@ -251,7 +247,7 @@ namespace Console {
 namespace Internet {
 
     [[nodiscard]] inline bool check_connection() {
-        HINTERNET hSession = WinHttpOpen(L"LinuxCompatChecker/2.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        HINTERNET hSession = WinHttpOpen(L"LinuxCompatChecker/2.2", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!hSession) return false;
 
@@ -287,11 +283,6 @@ public:
 protected:
     [[nodiscard]] static CompatItem* new_item(CompatReport& r) { return r.add_item(); }
 
-    static bool try_item(CompatReport& r, CompatItem*& out) {
-        out = r.add_item();
-        return out != nullptr;
-    }
-
     static bool enumerate_devices(const GUID* cls_guid, const std::function<void(std::string_view name, std::string_view hw_id)>& callback) {
         HDEVINFO devInfo = SetupDiGetClassDevsA(cls_guid, nullptr, nullptr, DIGCF_PRESENT);
         if (devInfo == INVALID_HANDLE_VALUE) return false;
@@ -319,157 +310,9 @@ protected:
     }
 };
 
-/* =================================================================
- * ÖZEL ANALİZÖRLER - ÇEKİRDEK SÜRÜCÜSÜ (DRIVER) ILE KONUŞANLAR
- * ================================================================= */
-
-class DriverPciAnalyzer : public Analyzer {
-    HANDLE m_hDriver;
-public:
-    explicit DriverPciAnalyzer(HANDLE hDriver) : m_hDriver(hDriver) {}
-    void analyze(CompatReport& report) override {
-        if (m_hDriver == INVALID_HANDLE_VALUE) return;
-
-        auto res = std::make_unique<LCC_PCI_RESULT>();
-        DWORD bytesReturned = 0;
-
-        if (DeviceIoControl(m_hDriver, IOCTL_LCC_GET_PCI_DEVICES, nullptr, 0, res.get(), sizeof(LCC_PCI_RESULT), &bytesReturned, nullptr)) {
-            bool ok = false;
-            if (bytesReturned >= sizeof(UINT32)) {
-                if (res->count <= LCC_MAX_PCI_DEVICES) {
-                    size_t expected = sizeof(UINT32) + (size_t)res->count * sizeof(LCC_PCI_DEVICE);
-                    if ((size_t)bytesReturned >= expected && (size_t)bytesReturned <= sizeof(LCC_PCI_RESULT)) {
-                        ok = true;
-                    }
-                }
-            }
-
-            if (ok) {
-                CompatItem* itp = new_item(report);
-                if (!itp) return;
-                itp->category = std::string(CAT_DRV_PCI);
-                itp->name = std::format("Hardware scan: {} PCI devices found", res->count);
-                itp->score = CompatScore::FULL;
-                itp->detail = "Raw PCI configuration space was successfully read through the kernel driver.";
-                itp->recommendation = "Direct hardware access is available. Driver communication appears healthy.";
-                itp->critical = false;
-            } else {
-                CompatItem* itp = new_item(report);
-                if (!itp) return;
-                itp->category = std::string(CAT_DRV_PCI);
-                itp->name = "PCI Taraması Başarısız (malformed response)";
-                itp->score = CompatScore::MAYBE;
-                itp->detail = std::format("Sürücüden gelen yanıt doğrulanamadı (bytes=%u, count=%u)", bytesReturned, res->count);
-                itp->recommendation = "Sürücünün doğru çalıştığından ve ABI uyumlu olduğundan emin olun.";
-            }
-        } else {
-            CompatItem* itp = new_item(report);
-            if (!itp) return;
-            itp->category = std::string(CAT_DRV_PCI);
-            itp->name = "PCI Taraması Başarısız";
-            itp->score = CompatScore::MAYBE;
-            itp->detail = std::format("Sürücüye gönderilen IOCTL_LCC_GET_PCI_DEVICES isteği başarısız oldu. Hata: {}", GetLastError());
-            itp->recommendation = "Sürücünün doğru çalıştığından ve yüklenmiş olduğundan emin olun.";
-        }
-    }
-};
-
-class DriverAcpiAnalyzer : public Analyzer {
-    HANDLE m_hDriver;
-public:
-    explicit DriverAcpiAnalyzer(HANDLE hDriver) : m_hDriver(hDriver) {}
-    void analyze(CompatReport& report) override {
-        if (m_hDriver == INVALID_HANDLE_VALUE) return;
-
-        auto res = std::make_unique<LCC_ACPI_RESULT>();
-        DWORD bytesReturned = 0;
-
-        if (DeviceIoControl(m_hDriver, IOCTL_LCC_GET_ACPI_INFO, nullptr, 0, res.get(), sizeof(LCC_ACPI_RESULT), &bytesReturned, nullptr)) {
-            bool ok = (bytesReturned >= sizeof(LCC_ACPI_RESULT)) && (res->count <= LCC_MAX_ACPI_TABLES);
-            if (ok) {
-                CompatItem* itp = new_item(report);
-                if (!itp) return;
-                itp->category = std::string(CAT_DRV_ACP);
-                itp->name = std::format("ACPI tables: {} entries found", res->count);
-                itp->score = res->xsdt_present ? CompatScore::FULL : CompatScore::MINOR;
-                itp->detail = std::format("ACPI version: {}, XSDT: {}, RSDP: {}", 
-                                          res->acpi_revision, res->xsdt_present ? "Yes" : "No", res->has_rsdp ? "Yes" : "No");
-                itp->recommendation = res->xsdt_present 
-                    ? "Modern XSDT is available. Linux power and hardware management should work well." 
-                    : "Only legacy RSDT is available. Some modern power management features may be limited.";
-                itp->critical = false;
-            } else {
-                CompatItem* itp = new_item(report);
-                if (!itp) return;
-                itp->category = std::string(CAT_DRV_ACP);
-                itp->name = "ACPI read failed (malformed response)";
-                itp->score = CompatScore::MAYBE;
-                itp->detail = std::format("Driver ACPI response could not be validated (bytes=%u, count=%u)", bytesReturned, res->count);
-                itp->recommendation = "Ensure the driver supports ACPI queries and returns valid data.";
-            }
-        }
-    }
-};
-
-class DriverMsrAnalyzer : public Analyzer {
-    HANDLE m_hDriver;
-public:
-    explicit DriverMsrAnalyzer(HANDLE hDriver) : m_hDriver(hDriver) {}
-    void analyze(CompatReport& report) override {
-        if (m_hDriver == INVALID_HANDLE_VALUE) return;
-
-        LCC_MSR_REQUEST req{};
-        req.msr_address = MSR_IA32_FEATURE_CONTROL; // 0x3A (VMX / Sanallaştırma kilidi vb.)
-        req.cpu_index = 0;
-
-        LCC_MSR_RESULT res{};
-        DWORD bytesReturned = 0;
-
-        if (DeviceIoControl(m_hDriver, IOCTL_LCC_GET_CPU_MSR, &req, sizeof(req), &res, sizeof(res), &bytesReturned, nullptr)) {
-            if (bytesReturned >= sizeof(LCC_MSR_RESULT)) {
-                CompatItem* itp = new_item(report);
-                if (!itp) return;
-                itp->category = std::string(CAT_DRV_MSR);
-
-                if (res.valid) {
-                bool isLocked = (res.value & 1) != 0;
-                bool vmxEnabled = (res.value & 4) != 0;
-
-                itp->name = std::format("MSR 0x3A (Feature Control): 0x{:X}", res.value);
-
-                if (isLocked && !vmxEnabled) {
-                    itp->score = CompatScore::MINOR;
-                    itp->detail = "Hardware virtualization (VT-x/VMX) is disabled or locked in BIOS.";
-                    itp->recommendation = "Reboot and enable virtualization support in BIOS/UEFI to use KVM/QEMU.";
-                } else {
-                    itp->score = CompatScore::FULL;
-                    itp->detail = "Hardware virtualization (VT-x/VMX) is enabled and accessible.";
-                    itp->recommendation = "KVM/QEMU virtualization tools are ready for full performance on Linux.";
-                }
-                } else {
-                    itp->score = CompatScore::MINOR;
-                    itp->name = "MSR 0x3A (Feature Control): Unsupported / unreadable";
-                    itp->detail = "The processor does not support this register or a hypervisor is blocking access.";
-                    itp->recommendation = "MSR access may fail on AMD CPUs or inside VirtualBox/VMware. This is expected in some cases.";
-                }
-                itp->critical = false;
-            } else {
-                CompatItem* itp = new_item(report);
-                if (!itp) return;
-                itp->category = std::string(CAT_DRV_MSR);
-                itp->name = "MSR Sorgusu Başarısız (malformed response)";
-                itp->score = CompatScore::MAYBE;
-                itp->detail = std::format("Sürücüden gelen MSR yanıtı beklenen boyutta değil (bytes=%u)", bytesReturned);
-                itp->recommendation = "Sürücünün ABI uyumluluğunu doğrulayın.";
-                itp->critical = false;
-            }
-        }
-    }
-};
-
 
 /* =================================================================
- * Standart Windows API Analizörleri (Mevcut kodunuzun çevrilmiş hali)
+ * Standart Windows API Analizörleri
  * ================================================================= */
 
 class CpuAnalyzer : public Analyzer {
@@ -505,10 +348,10 @@ public:
         __cpuid(info, 1);
         const bool has_sse2 = (info[3] >> 26) & 1;
         const bool has_avx  = (info[2] >> 28) & 1;
-        const bool has_vmx  = (info[2] >> 5) & 1;  
+        const bool has_vmx  = (info[2] >> 5) & 1;
 
         __cpuid(info, 0x80000001);
-        const bool has_svm = (info[2] >> 2) & 1;   
+        const bool has_svm = (info[2] >> 2) & 1;
 
         SYSTEM_INFO si{};
         GetSystemInfo(&si);
@@ -587,15 +430,12 @@ public:
         bool is_nvme = false;
 
         /*
-         * BUG FIX #4 — PhysicalDrive0 hardcode
-         * ----------------------------------------
-         * Always querying PhysicalDrive0 is wrong when the OS lives on
-         * a different disk (e.g. NVMe on Drive1, SATA data on Drive0).
-         *
-         * Fix: open the C: volume, call IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS
-         * to learn which physical disk number backs it, then open that disk.
+         * PhysicalDrive0'ı sabit varsaymak yanlış olurdu; işletim sistemi
+         * farklı bir diskte (ör. NVMe Drive1'de, SATA veri Drive0'da)
+         * olabilir. Önce C: birimini açıp hangi fiziksel diske ait
+         * olduğunu IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS ile öğreniyoruz.
          */
-        DWORD physDriveNumber = 0;   /* fallback */
+        DWORD physDriveNumber = 0;   /* varsayılan */
         {
             HANDLE hVol = CreateFileA("\\\\.\\C:",
                                       0,
@@ -970,7 +810,7 @@ public:
     void analyze(CompatReport& report) override {
         if (!m_online) return;
 
-        HINTERNET hSession = WinHttpOpen(L"LinuxCompatChecker/2.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        HINTERNET hSession = WinHttpOpen(L"LinuxCompatChecker/2.2", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!hSession) return;
 
@@ -1042,8 +882,8 @@ public:
 
         constexpr std::array categories{
             CAT_CPU, CAT_RAM, CAT_DISK, CAT_GPU, CAT_NET,
-            CAT_AUDIO, CAT_FW, CAT_SB, CAT_TPM, CAT_POWER, CAT_VIRT, 
-            CAT_DRV_PCI, CAT_DRV_ACP, CAT_DRV_MSR, CAT_ONLINE
+            CAT_AUDIO, CAT_FW, CAT_SB, CAT_TPM, CAT_POWER, CAT_VIRT,
+            CAT_ONLINE
         };
 
         for (const auto& cat : categories) {
@@ -1104,7 +944,7 @@ public:
                m_online ? "Online — kernel.org data fetched." : "Offline — local analysis only.", RESET);
 
         printf("\n%s%s════════════════════════════════════════════════════════════════\n%s", CYAN, BOLD, RESET);
-        printf("%s  Linux Compatibility Checker v2.1  |  linux-hardware.org\n%s", DIM, RESET);
+        printf("%s  Linux Compatibility Checker v2.2  |  linux-hardware.org\n%s", DIM, RESET);
         printf("%s%s════════════════════════════════════════════════════════════════\n\n%s", CYAN, BOLD, RESET);
     }
 
@@ -1123,20 +963,17 @@ struct StepMeta {
     bool        online_only = false;
 };
 
-inline constexpr std::array<StepMeta, 13> PIPELINE_STEPS{{
-    { "Step 2/14: CPU analysis in progress          ",  8, 30, false },
-    { "Step 3/14: Memory (RAM) analysis            ",  6, 25, false },
-    { "Step 4/14: Disk and storage analysis        ",  7, 35, false },
-    { "Step 5/14: Graphics (GPU) scan              ",  9, 40, false },
-    { "Step 6/14: Networking inspection            ",  8, 35, false },
-    { "Step 7/14: Audio device inspection          ",  6, 30, false },
-    { "Step 8/14: Firmware / UEFI check            ",  7, 25, false },
-    { "Step 9/14: Power and battery status         ",  4, 20, false },
-    { "Step 10/14: Virtualization environment      ",  4, 20, false },
-    { "Step 11/14: DRIVER: Ring-0 PCI scan         ",  8, 30, false },  /* kernel driver only */
-    { "Step 12/14: DRIVER: Ring-0 ACPI read         ",  8, 30, false },
-    { "Step 13/14: DRIVER: MSR processor query      ",  5, 20, false },
-    { "Step 14/14: kernel.org online lookup        ", 12, 60, true  },
+inline constexpr std::array<StepMeta, 10> PIPELINE_STEPS{{
+    { "Step 2/11: CPU analysis in progress          ",  8, 30, false },
+    { "Step 3/11: Memory (RAM) analysis            ",  6, 25, false },
+    { "Step 4/11: Disk and storage analysis        ",  7, 35, false },
+    { "Step 5/11: Graphics (GPU) scan              ",  9, 40, false },
+    { "Step 6/11: Networking inspection            ",  8, 35, false },
+    { "Step 7/11: Audio device inspection          ",  6, 30, false },
+    { "Step 8/11: Firmware / UEFI check            ",  7, 25, false },
+    { "Step 9/11: Power and battery status         ",  4, 20, false },
+    { "Step 10/11: Virtualization environment      ",  4, 20, false },
+    { "Step 11/11: kernel.org online lookup        ", 12, 60, true  },
 }};
 
 
@@ -1150,7 +987,7 @@ int main(int argc, char* argv[]) {
             save_path = argv[++i];
         }
     }
-    
+
     Console::enable_ansi();
     Console::print_header();
 
@@ -1168,28 +1005,9 @@ int main(int argc, char* argv[]) {
     printf("%s  Date / time    : %02d/%02d/%04d  %02d:%02d\n\n%s", DIM, st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute, RESET);
 
     /* STEP 1: Internet */
-    printf("%s  Step 1/14: %sTesting internet connectivity...\n", CYAN, RESET);
+    printf("%s  Step 1/11: %sTesting internet connectivity...\n", CYAN, RESET);
     const bool g_online = Internet::check_connection();
     printf("              %s%s%s\n\n", g_online ? GREEN : YELLOW, g_online ? "✓ Online" : "✗ Offline", RESET);
-
-    /* ÇEKİRDEK SÜRÜCÜ (DRIVER) BAĞLANTISI VE HABERLEŞME TESTİ */
-    printf("%s  [SYSTEM]  : %sLooking for kernel-mode driver (LccDriver)...\n", BLUE, RESET);
-    HANDLE hDriver = CreateFileA(LCC_USERMODE_PATH, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hDriver != INVALID_HANDLE_VALUE) {
-        LCC_VERSION_RESULT ver{};
-        DWORD retBytes = 0;
-        if (DeviceIoControl(hDriver, IOCTL_LCC_GET_VERSION, nullptr, 0, &ver, sizeof(ver), &retBytes, nullptr)) {
-            if (retBytes == sizeof(ver)) {
-                printf("              %s✓ Driver found and connected. (Version: v%u.%u)%s\n\n", GREEN, ver.driver_version >> 8, ver.driver_version & 0xFF, RESET);
-            } else {
-                printf("              %s✗ Unexpected driver response size (bytes=%u).\n\n", YELLOW, retBytes);
-            }
-        } else {
-            printf("              %s✗ Connected to driver but DeviceIoControl failed.%s\n\n", YELLOW, RESET);
-        }
-    } else {
-        printf("              %s✗ Driver not found. (LccDriver not installed) Kernel-level checks will be skipped.%s\n\n", RED, RESET);
-    }
 
     /* Analizörleri Sırala */
     std::vector<std::unique_ptr<Analyzer>> analyzers;
@@ -1203,15 +1021,9 @@ int main(int argc, char* argv[]) {
     analyzers.push_back(std::make_unique<FirmwareAnalyzer>());
     analyzers.push_back(std::make_unique<PowerAnalyzer>());
     analyzers.push_back(std::make_unique<VirtualizationAnalyzer>());
-    
-    /* YENİ SÜRÜCÜ ANALİZÖRLERİNİ EKLİYORUZ (Driver Handle vererek) */
-    analyzers.push_back(std::make_unique<DriverPciAnalyzer>(hDriver));
-    analyzers.push_back(std::make_unique<DriverAcpiAnalyzer>(hDriver));
-    analyzers.push_back(std::make_unique<DriverMsrAnalyzer>(hDriver));
-    
     analyzers.push_back(std::make_unique<OnlineAnalyzer>(g_online));
 
-    static_assert(PIPELINE_STEPS.size() == 13, "PIPELINE_STEPS sayısı analizör sayısı ile eşleşmeli (Internet adımı hariç 13)");
+    static_assert(PIPELINE_STEPS.size() == 10, "PIPELINE_STEPS sayısı analizör sayısı ile eşleşmeli (Internet adımı hariç 10)");
 
     CompatReport report;
 
@@ -1222,12 +1034,6 @@ int main(int argc, char* argv[]) {
         if (meta.online_only && !g_online) {
             printf("%s  %s — Skipped (offline).\n%s", DIM, meta.label, RESET);
             continue;
-        }
-
-        /* If the driver is missing, skip the driver-specific steps */
-        if (hDriver == INVALID_HANDLE_VALUE && (i == 9 || i == 10 || i == 11)) {
-            printf("%s  %s — Skipped (driver unavailable).\n%s", DIM, meta.label, RESET);
-            continue; 
         }
 
         if (meta.label)
@@ -1243,7 +1049,7 @@ int main(int argc, char* argv[]) {
     if (!save_path.empty()) {
         FILE* f = fopen(save_path.c_str(), "w");
         if (f) {
-            fprintf(f, "Linux Compatibility Checker v2.1 — Report\n");
+            fprintf(f, "Linux Compatibility Checker v2.2 — Report\n");
             fprintf(f, "Computer name : %s\n", computer_name);
             fprintf(f, "OS version    : %s\n", os_name.c_str());
             fprintf(f, "Date          : %02d/%02d/%04d  %02d:%02d\n\n", st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute);
@@ -1268,11 +1074,6 @@ int main(int argc, char* argv[]) {
         } else {
             printf("%s  ✗ Failed to save report to file: %s\n%s", RED, save_path.c_str(), RESET);
         }
-    }
-
-    /* Uygulama biterken çekirdek sürücüsünün bağlantısını kapatmayı unutmuyoruz */
-    if (hDriver != INVALID_HANDLE_VALUE) {
-        CloseHandle(hDriver);
     }
 
     printf("  Çıkmak için Enter'a basın...\n");
