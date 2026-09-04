@@ -6,7 +6,7 @@
  *
  * Bu sürüm hiçbir çekirdek modu (Ring-0) sürücüsü kullanmaz;
  * tüm veriler standart, imzasız Win32 kullanıcı-modu API'leriyle
- * toplanır (SetupAPI, WinHTTP, CPUID, GetDiskFreeSpaceEx vb.).
+ * toplanır (SetupAPI, WinHTTP, Registry, GetDiskFreeSpaceEx vb.).
  *
  * Puanlar: 0=Tam Uyumlu | 1=Uyumlu (küçük sorunlar)
  * 2=Olası Uyumsuz | 3=Uyumsuz
@@ -14,8 +14,10 @@
  * Kullanım:
  * linux_compat_checker.exe [--save <rapor.txt>]
  *
- * Derleme (MSVC):
- * cl linux_compat_checker.cpp /Fe:linux_compat_checker.exe /EHsc /std:c++latest /link advapi32.lib setupapi.lib winhttp.lib
+ * MinGW/LLVM-Clang (all Windows CPU architectures):
+ * aarch64-w64-mingw32-g++ -O3 -std=c++20 linux_compat_checker_portable.cpp -o linux_compat_checker_arm64.exe -ladvapi32 -lsetupapi -lwinhttp
+ * x86_64-w64-mingw32-g++   -O3 -std=c++20 linux_compat_checker_portable.cpp -o linux_compat_checker_x64.exe   -ladvapi32 -lsetupapi -lwinhttp
+ * i686-w64-mingw32-g++      -O3 -std=c++20 linux_compat_checker_portable.cpp -o linux_compat_checker_x86.exe   -ladvapi32 -lsetupapi -lwinhttp
  */
 #define NOMINMAX
 #define _WIN32_WINNT 0x0A00   /* Windows 10+ */
@@ -28,7 +30,6 @@
 #include <setupapi.h>
 #include <devguid.h>
 #include <winhttp.h>
-#include <intrin.h>
 #include <winioctl.h>    /* IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, IOCTL_STORAGE_QUERY_PROPERTY için */
 
 #include <cstdio>
@@ -42,9 +43,11 @@
 #include <optional>
 #include <functional>
 
-#pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "setupapi.lib")
-#pragma comment(lib, "winhttp.lib")
+/*
+ * NOTE: MinGW/LLVM-Clang does not rely on MSVC-style #pragma comment(lib).
+ * The required import libraries are therefore passed explicitly to the
+ * linker with -ladvapi32 -lsetupapi -lwinhttp.
+ */
 
 /* ─── ANSI renk kodları (Windows 10+ sanal terminal gerektirir) ─── */
 inline constexpr const char* RESET  = "\033[0m";
@@ -315,72 +318,158 @@ protected:
  * Standart Windows API Analizörleri
  * ================================================================= */
 
+namespace CpuInfo {
+
+    enum class Architecture {
+        X86,
+        X64,
+        ARM,
+        ARM64,
+        IA64,
+        Unknown
+    };
+
+    [[nodiscard]] inline Architecture architecture() noexcept {
+        SYSTEM_INFO si{};
+        GetNativeSystemInfo(&si);
+
+        switch (si.wProcessorArchitecture) {
+            case PROCESSOR_ARCHITECTURE_INTEL: return Architecture::X86;
+            case PROCESSOR_ARCHITECTURE_AMD64: return Architecture::X64;
+            case PROCESSOR_ARCHITECTURE_ARM:   return Architecture::ARM;
+            case PROCESSOR_ARCHITECTURE_ARM64: return Architecture::ARM64;
+            case PROCESSOR_ARCHITECTURE_IA64:  return Architecture::IA64;
+            default:                           return Architecture::Unknown;
+        }
+    }
+
+    [[nodiscard]] inline const char* architecture_name(Architecture arch) noexcept {
+        switch (arch) {
+            case Architecture::X86:   return "x86";
+            case Architecture::X64:   return "x86-64";
+            case Architecture::ARM:   return "ARM32";
+            case Architecture::ARM64: return "ARM64";
+            case Architecture::IA64:  return "IA-64";
+            default:                  return "Unknown";
+        }
+    }
+
+    [[nodiscard]] inline std::string processor_registry_string(const char* value_name) {
+        return Registry::read_string(
+            HKEY_LOCAL_MACHINE,
+            "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+            value_name
+        ).value_or("");
+    }
+
+    [[nodiscard]] inline bool feature(DWORD feature_id) noexcept {
+        return IsProcessorFeaturePresent(feature_id) != FALSE;
+    }
+
+    /* IsProcessorFeaturePresent feature IDs are part of the Win32 API.
+       Keep the numeric values local so this code also builds with older
+       Windows SDK / MinGW headers that may not expose newer ARM defines. */
+    inline constexpr DWORD PF_ARM_V8               = 29;
+    inline constexpr DWORD PF_ARM_V8_CRYPTO        = 30;
+    inline constexpr DWORD PF_ARM_V8_CRC32         = 31;
+    inline constexpr DWORD PF_ARM_V81_ATOMIC       = 34;
+    inline constexpr DWORD PF_ARM_SVE              = 46;
+    inline constexpr DWORD PF_ARM_SVE2             = 47;
+    inline constexpr DWORD PF_AVX                  = 39;
+    inline constexpr DWORD PF_AVX2                 = 40;
+    inline constexpr DWORD PF_SSE2                 = 10;
+    inline constexpr DWORD PF_VIRT_FIRMWARE        = 21;
+
+}
+
 class CpuAnalyzer : public Analyzer {
 public:
     void analyze(CompatReport& report) override {
-        int info[4]{};
-        __cpuid(info, 0);
+        using namespace CpuInfo;
 
-        union { int i[3]; char c[12]; } vendor_raw{};
-        vendor_raw.i[0] = info[1];
-        vendor_raw.i[1] = info[3];
-        vendor_raw.i[2] = info[2];
-        std::string vendor(vendor_raw.c, strnlen(vendor_raw.c, sizeof(vendor_raw.c)));
+        const Architecture arch = architecture();
+        const std::string arch_name = architecture_name(arch);
 
-        char brand[49]{};
-        __cpuid(info, 0x80000000);
-        if (static_cast<unsigned>(info[0]) >= 0x80000004u) {
-            __cpuid(info, 0x80000002); memcpy(brand,      info, 16);
-            __cpuid(info, 0x80000003); memcpy(brand + 16, info, 16);
-            __cpuid(info, 0x80000004); memcpy(brand + 32, info, 16);
-        }
-
-        std::string brand_str(brand[0] ? brand : "");
-        {
-            auto first = brand_str.find_first_not_of(' ');
-            auto last  = brand_str.find_last_not_of(' ');
-            if (first != std::string::npos)
-                brand_str = brand_str.substr(first, last - first + 1);
-            else
-                brand_str.clear();
-        }
-
-        __cpuid(info, 1);
-        const bool has_sse2 = (info[3] >> 26) & 1;
-        const bool has_avx  = (info[2] >> 28) & 1;
-        const bool has_vmx  = (info[2] >> 5) & 1;
-
-        __cpuid(info, 0x80000001);
-        const bool has_svm = (info[2] >> 2) & 1;
+        const std::string processor_name = processor_registry_string("ProcessorNameString");
+        const std::string vendor          = processor_registry_string("VendorIdentifier");
+        const std::string identifier      = processor_registry_string("Identifier");
 
         SYSTEM_INFO si{};
-        GetSystemInfo(&si);
+        GetNativeSystemInfo(&si);
         const DWORD cores = si.dwNumberOfProcessors;
-
-        const bool is_intel = vendor.find("GenuineIntel") != std::string::npos;
-        const bool is_amd   = vendor.find("AuthenticAMD") != std::string::npos;
 
         CompatItem* itp = new_item(report);
         if (!itp) return;
         CompatItem& it = *itp;
-        it.category    = std::string(CAT_CPU);
-        it.name        = !brand_str.empty() ? brand_str : vendor;
-        it.critical    = true;
+        it.category = std::string(CAT_CPU);
+        it.critical = true;
+        it.name = !processor_name.empty()
+            ? processor_name
+            : (!vendor.empty() ? vendor : std::string("CPU (") + arch_name + ")");
 
-        if (is_intel || is_amd) {
-            it.score = CompatScore::FULL;
-            it.detail = std::format("{} {} | {} logical cores | SSE2:{}  AVX:{}  VT-x/AMD-V:{}",
-                                    is_intel ? "Intel" : "AMD",
-                                    !brand_str.empty() ? brand_str : "",
-                                    cores,
-                                    has_sse2 ? "Yes" : "No",
-                                    has_avx  ? "Yes" : "No",
-                                    (is_intel ? has_vmx : has_svm) ? "Yes" : "No");
-            it.recommendation = "Excellent Linux support. Any mainstream distro should work well.";
-        } else {
-            it.score  = CompatScore::MAYBE;
-            it.detail = std::format("Non-x86 CPU detected: Vendor='{}', {} logical cores", vendor, cores);
-            it.recommendation = "ARM Linux support is improving, but some x86-only software may not run. Try Ubuntu ARM or Fedora ARM.";
+        switch (arch) {
+            case Architecture::X86:
+            case Architecture::X64: {
+                const bool has_sse2 = feature(PF_SSE2);
+                const bool has_avx  = feature(PF_AVX);
+                const bool has_avx2 = feature(PF_AVX2);
+                const bool has_vt   = feature(PF_VIRT_FIRMWARE);
+
+                it.score = CompatScore::FULL;
+                it.detail = std::format(
+                    "{} | Vendor: {} | {} logical cores | SSE2:{}  AVX:{}  AVX2:{}  HW virtualization:{}{}",
+                    !processor_name.empty() ? processor_name : std::string("x86 CPU"),
+                    !vendor.empty() ? vendor : "unknown",
+                    cores,
+                    has_sse2 ? "Yes" : "No",
+                    has_avx  ? "Yes" : "No",
+                    has_avx2 ? "Yes" : "No",
+                    has_vt   ? "Available" : "Not reported",
+                    identifier.empty() ? "" : std::string(" | Identifier: ") + identifier
+                );
+                it.recommendation =
+                    "Excellent Linux support. Any mainstream x86-64 distribution should work well.";
+                break;
+            }
+
+            case Architecture::ARM:
+            case Architecture::ARM64: {
+                const bool armv8  = feature(PF_ARM_V8);
+                const bool crypto = feature(PF_ARM_V8_CRYPTO);
+                const bool crc32  = feature(PF_ARM_V8_CRC32);
+                const bool atom   = feature(PF_ARM_V81_ATOMIC);
+                const bool sve    = feature(PF_ARM_SVE);
+                const bool sve2   = feature(PF_ARM_SVE2);
+
+                it.score = CompatScore::FULL;
+                it.detail = std::format(
+                    "{} | Vendor: {} | {} logical cores | ARMv8:{}  Crypto:{}  CRC32:{}  ARMv8.1 atomics:{}  SVE:{}  SVE2:{}",
+                    !processor_name.empty() ? processor_name : std::string("ARM CPU"),
+                    !vendor.empty() ? vendor : "unknown",
+                    cores,
+                    armv8 ? "Yes" : "No",
+                    crypto ? "Yes" : "No",
+                    crc32 ? "Yes" : "No",
+                    atom ? "Yes" : "No",
+                    sve ? "Yes" : "No",
+                    sve2 ? "Yes" : "No"
+                );
+                it.recommendation =
+                    "ARM Linux is supported, but package and driver availability depends on the exact SoC/device. Prefer a distribution image built for your ARM architecture.";
+                break;
+            }
+
+            default:
+                it.score = CompatScore::MAYBE;
+                it.detail = std::format(
+                    "Architecture: {} | Vendor: {} | {} logical cores",
+                    arch_name,
+                    !vendor.empty() ? vendor : "unknown",
+                    cores
+                );
+                it.recommendation =
+                    "This CPU architecture is not specifically covered by the checker. Verify Linux kernel and distribution support for the target platform.";
+                break;
         }
     }
 };
@@ -780,26 +869,27 @@ public:
 class VirtualizationAnalyzer : public Analyzer {
 public:
     void analyze(CompatReport& report) override {
-        int info[4]{};
-        __cpuid(info, 1);
-        if (!((info[2] >> 31) & 1)) return; // Sanal ortam değil
+        /* CPUID leaf 0x40000000 was x86-specific. Instead, use the
+           architecture-neutral Win32 processor feature API. Note that
+           PF_VIRT_FIRMWARE_ENABLED means hardware virtualization is enabled
+           and exposed to Windows; it does NOT by itself prove that we are
+           running inside a virtual machine. */
+        constexpr DWORD PF_VIRT_FIRMWARE = 21;
+        const bool virtualization_available =
+            IsProcessorFeaturePresent(PF_VIRT_FIRMWARE) != FALSE;
 
-        union { int i[3]; char c[12]; } hv_raw{};
-        __cpuid(info, 0x40000000);
-        hv_raw.i[0] = info[1];
-        hv_raw.i[1] = info[2];
-        hv_raw.i[2] = info[3];
-        const std::string hv_name(hv_raw.c, strnlen(hv_raw.c, sizeof(hv_raw.c)));
+        if (!virtualization_available)
+            return;
 
         CompatItem* itp = new_item(report);
         if (!itp) return;
-        CompatItem& it    = *itp;
+        CompatItem& it = *itp;
         it.category       = std::string(CAT_VIRT);
-        it.name           = std::format("Virtual machine detected: {}", hv_name);
+        it.name           = "Hardware virtualization available";
         it.critical       = false;
-        it.score          = CompatScore::MINOR;
-        it.detail         = std::format("Hypervisor: {} — this compatibility scan is running inside a VM.", hv_name);
-        it.recommendation = "Results may not reflect physical hardware compatibility. Run on bare metal for the most accurate assessment.";
+        it.score          = CompatScore::FULL;
+        it.detail         = "Windows reports that hardware virtualization is enabled and available to the operating system.";
+        it.recommendation = "Linux KVM/QEMU, Hyper-V based workflows, and other virtualization features can use the available hardware virtualization support.";
     }
 };
 
