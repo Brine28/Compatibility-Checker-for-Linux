@@ -567,7 +567,7 @@ public:
             spq_desc.QueryType  = PropertyStandardQuery;
             char desc_buf[2048]{};
             if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &spq_desc, sizeof(spq_desc), desc_buf, sizeof(desc_buf), &bytes_returned, nullptr)) {
-                auto* desc = reinterpret_cast<STORAGE_DEVICE_DESCRIPTOR*>(desc_buf);
+            const auto* desc = reinterpret_cast<const STORAGE_DEVICE_DESCRIPTOR*>(desc_buf);
                 is_nvme = (desc->BusType == BusTypeNvme);
             }
             CloseHandle(hDisk);
