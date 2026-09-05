@@ -606,7 +606,7 @@ public:
 class GpuAnalyzer : public Analyzer {
 public:
     void analyze(CompatReport& report) override {
-        bool found = enumerate_devices(&GUID_DEVCLASS_DISPLAY, [&](std::string_view name, std::string_view hw_id) {
+        bool found = enumerate_devices(&GUID_DEVCLASS_DISPLAY, [&](std::string_view name, std::string_view /*hw_id*/) {
             auto has = [&](std::string_view s) { return name.find(s) != std::string_view::npos; };
 
             CompatItem* itp = new_item(report);
@@ -721,7 +721,7 @@ public:
 class AudioAnalyzer : public Analyzer {
 public:
     void analyze(CompatReport& report) override {
-        bool found = enumerate_devices(&GUID_DEVCLASS_MEDIA, [&](std::string_view name, std::string_view hw_id) {
+        bool found = enumerate_devices(&GUID_DEVCLASS_MEDIA, [&](std::string_view name, std::string_view /*hw_id*/) {
             auto has = [&](std::string_view s) { return name.find(s) != std::string_view::npos; };
 
             if (has("Virtual") || has("Microsoft")) return;
