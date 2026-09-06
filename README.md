@@ -115,8 +115,6 @@ When the scan finishes, the program waits for Enter before exiting. Console colo
 ## Privacy and safety
 
 - The checker performs read-only hardware and system inspection.
-- It does not install drivers or services.
-- It does not modify the registry, firmware, partitions, or boot configuration.
 - No telemetry is collected. Network requests are limited to the optional HTTPS connectivity check and the `www.kernel.org` request for the latest stable kernel version.
 
 ## License
