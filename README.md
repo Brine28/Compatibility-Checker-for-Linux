@@ -2,8 +2,6 @@
 
 Linux Compatibility Checker is a Windows user-mode console application that evaluates whether a Windows PC is ready for a Linux migration. It reads hardware and system information through standard Win32 APIs, assigns a compatibility score to each finding, and prints a migration-readiness report.
 
-The checker does not install a kernel driver, modify firmware or partitions, or change the Windows configuration. It is a read-only assessment tool.
-
 ## Features
 
 The application inspects:
