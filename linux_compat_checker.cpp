@@ -15,16 +15,16 @@
  * linux_compat_checker.exe [--save <rapor.txt>]
  *
  * MinGW/LLVM-Clang (all Windows CPU architectures):
- * aarch64-w64-mingw32-g++ -O3 -std=c++20 linux_compat_checker_portable.cpp -o linux_compat_checker_arm64.exe -ladvapi32 -lsetupapi -lwinhttp
- * x86_64-w64-mingw32-g++   -O3 -std=c++20 linux_compat_checker_portable.cpp -o linux_compat_checker_x64.exe   -ladvapi32 -lsetupapi -lwinhttp
- * i686-w64-mingw32-g++      -O3 -std=c++20 linux_compat_checker_portable.cpp -o linux_compat_checker_x86.exe   -ladvapi32 -lsetupapi -lwinhttp
+ * aarch64-w64-mingw32-g++ -O3 -std=c++20 -mconsole linux_compat_checker.cpp -o linux_compat_checker_arm64.exe -ladvapi32 -lsetupapi -lwinhttp -lshell32
+ * x86_64-w64-mingw32-g++   -O3 -std=c++20 -mconsole linux_compat_checker.cpp -o linux_compat_checker_x64.exe -ladvapi32 -lsetupapi -lwinhttp -lshell32
+ * i686-w64-mingw32-g++      -O3 -std=c++20 -mconsole linux_compat_checker.cpp -o linux_compat_checker_x86.exe -ladvapi32 -lsetupapi -lwinhttp -lshell32
  */
 #define NOMINMAX
 #define _WIN32_WINNT 0x0A00   /* Windows 10+ */
-#define UNICODE
-#define _UNICODE
 
 #include <windows.h>
+#include <shellapi.h>
+#include <strsafe.h>
 #include <algorithm>
 #include <initguid.h>
 #include <setupapi.h>
@@ -46,8 +46,151 @@
 /*
  * NOTE: MinGW/LLVM-Clang does not rely on MSVC-style #pragma comment(lib).
  * The required import libraries are therefore passed explicitly to the
- * linker with -ladvapi32 -lsetupapi -lwinhttp.
+ * linker with -ladvapi32 -lsetupapi -lwinhttp -lshell32.
  */
+
+/* =================================================================
+ * UAC — Yönetici yetkisi
+ * -----------------------------------------------------------------
+ * Program normal yetkilerle başlatılırsa kendisini Windows UAC
+ * üzerinden "runas" verb'i ile yeniden başlatır. Böylece kullanıcı
+ * açıkça yönetici izni verir ve asıl analiz yalnızca yükseltilmiş
+ * süreçte devam eder.
+ * ================================================================= */
+namespace Elevation {
+
+    [[nodiscard]] bool is_process_elevated() noexcept {
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+            return false;
+
+        TOKEN_ELEVATION elevation{};
+        DWORD returned = 0;
+        const BOOL ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &elevation,
+            sizeof(elevation),
+                                            &returned);
+
+        CloseHandle(token);
+        return ok != FALSE && returned == sizeof(elevation)
+        && elevation.TokenIsElevated != 0;
+    }
+
+    [[nodiscard]] bool quote_argument(const std::wstring& arg, std::wstring& out) {
+        out.push_back(L'"');
+
+        std::size_t backslashes = 0;
+        for (wchar_t ch : arg) {
+            if (ch == L'\\') {
+                ++backslashes;
+                continue;
+            }
+
+            if (ch == L'"') {
+                out.append(backslashes * 2 + 1, L'\\');
+                out.push_back(L'"');
+                backslashes = 0;
+                continue;
+            }
+
+            out.append(backslashes, L'\\');
+            backslashes = 0;
+            out.push_back(ch);
+        }
+
+        /* Closing quote must escape trailing backslashes. */
+        out.append(backslashes * 2, L'\\');
+        out.push_back(L'"');
+        return true;
+    }
+
+    [[nodiscard]] std::optional<std::wstring> build_elevated_parameters() {
+        int argc = 0;
+        LPWSTR* argvw = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (!argvw)
+            return std::nullopt;
+
+        std::wstring params;
+        for (int i = 1; i < argc; ++i) {
+            if (!params.empty())
+                params.push_back(L' ');
+
+            std::wstring quoted;
+            if (!quote_argument(argvw[i], quoted)) {
+                LocalFree(argvw);
+                return std::nullopt;
+            }
+            params += quoted;
+        }
+
+        LocalFree(argvw);
+        return params;
+    }
+
+    [[nodiscard]] bool relaunch_as_administrator() noexcept {
+        wchar_t exe_path[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(nullptr, exe_path, ARRAYSIZE(exe_path));
+        if (length == 0 || length >= ARRAYSIZE(exe_path)) {
+            MessageBoxW(
+                nullptr,
+                L"Uygulamanın EXE yolu alınamadı. Yönetici olarak yeniden başlatılamıyor.",
+                L"Linux Compatibility Checker",
+                MB_OK | MB_ICONERROR);
+            return false;
+        }
+
+        const auto params = build_elevated_parameters();
+        if (!params) {
+            MessageBoxW(
+                nullptr,
+                L"Komut satırı parametreleri hazırlanamadı. Yönetici olarak yeniden başlatılamıyor.",
+                L"Linux Compatibility Checker",
+                MB_OK | MB_ICONERROR);
+            return false;
+        }
+
+        SHELLEXECUTEINFOW sei{};
+        sei.cbSize = sizeof(sei);
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        sei.lpVerb = L"runas";
+        sei.lpFile = exe_path;
+        sei.lpParameters = params->c_str();
+        sei.nShow = SW_SHOWNORMAL;
+
+        if (!ShellExecuteExW(&sei)) {
+            const DWORD error = GetLastError();
+            if (error == ERROR_CANCELLED) {
+                MessageBoxW(
+                    nullptr,
+                    L"Bu araç için yönetici yetkisi gerekiyor. İşlem iptal edildi.",
+                    L"Linux Compatibility Checker",
+                    MB_OK | MB_ICONWARNING);
+            } else {
+                wchar_t message[256]{};
+                StringCchPrintfW(
+                    message,
+                    ARRAYSIZE(message),
+                                 L"Yönetici yetkisi alınamadı (Windows hata kodu: %lu).",
+                                 static_cast<unsigned long>(error));
+                MessageBoxW(
+                    nullptr,
+                    message,
+                    L"Linux Compatibility Checker",
+                    MB_OK | MB_ICONERROR);
+            }
+            return false;
+        }
+
+        if (sei.hProcess)
+            CloseHandle(sei.hProcess);
+
+        return true;
+    }
+
+
+} // namespace Elevation
 
 /* ─── ANSI renk kodları (Windows 10+ sanal terminal gerektirir) ─── */
 inline constexpr const char* RESET  = "\033[0m";
@@ -132,8 +275,8 @@ public:
         }
 
         overall_percent = (total_weight > 0.0)
-            ? (weighted / total_weight) * 100.0
-            : 0.0;
+        ? (weighted / total_weight) * 100.0
+        : 0.0;
     }
 };
 
@@ -154,7 +297,7 @@ namespace Registry {
         DWORD sz   = sizeof(buf);
         bool  ok   = (RegQueryValueExA(hk, value, nullptr, &type,
                                        reinterpret_cast<LPBYTE>(buf), &sz) == ERROR_SUCCESS)
-                     && (type == REG_SZ || type == REG_EXPAND_SZ);
+        && (type == REG_SZ || type == REG_EXPAND_SZ);
         RegCloseKey(hk);
         if (!ok) return std::nullopt;
 
@@ -169,8 +312,10 @@ namespace Registry {
             return std::nullopt;
 
         DWORD val{}, type = REG_DWORD, sz = sizeof(DWORD);
-        bool  ok = (RegQueryValueExA(hk, value, nullptr, &type,
-                                     reinterpret_cast<LPBYTE>(&val), &sz) == ERROR_SUCCESS);
+        bool ok = (RegQueryValueExA(hk, value, nullptr, &type,
+                                    reinterpret_cast<LPBYTE>(&val), &sz) == ERROR_SUCCESS)
+        && type == REG_DWORD
+        && sz == sizeof(DWORD);
         RegCloseKey(hk);
         return ok ? std::optional<DWORD>{val} : std::nullopt;
     }
@@ -263,7 +408,7 @@ namespace Internet {
         bool ok = false;
         if (hRequest) {
             ok = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
-              && WinHttpReceiveResponse(hRequest, nullptr);
+            && WinHttpReceiveResponse(hRequest, nullptr);
             WinHttpCloseHandle(hRequest);
         }
 
@@ -298,7 +443,7 @@ protected:
 
         while (SetupDiEnumDeviceInfo(devInfo, idx++, &devData)) {
             if (!SetupDiGetDeviceRegistryPropertyA(devInfo, &devData, SPDRP_DEVICEDESC, nullptr,
-                                                   reinterpret_cast<PBYTE>(name_buf), sizeof(name_buf), nullptr))
+                reinterpret_cast<PBYTE>(name_buf), sizeof(name_buf), nullptr))
                 continue;
 
             hwid_buf[0] = '\0';
@@ -367,8 +512,8 @@ namespace CpuInfo {
     }
 
     /* IsProcessorFeaturePresent feature IDs are part of the Win32 API.
-       Keep the numeric values local so this code also builds with older
-       Windows SDK / MinGW headers that may not expose newer ARM defines. */
+     *       Keep the numeric values local so this code also builds with older
+     *       Windows SDK / MinGW headers that may not expose newer ARM defines. */
     inline constexpr DWORD PF_ARM_V8               = 29;
     inline constexpr DWORD PF_ARM_V8_CRYPTO        = 30;
     inline constexpr DWORD PF_ARM_V8_CRC32         = 31;
@@ -404,8 +549,8 @@ public:
         it.category = std::string(CAT_CPU);
         it.critical = true;
         it.name = !processor_name.empty()
-            ? processor_name
-            : (!vendor.empty() ? vendor : std::string("CPU (") + arch_name + ")");
+        ? processor_name
+        : (!vendor.empty() ? vendor : std::string("CPU (") + arch_name + ")");
 
         switch (arch) {
             case Architecture::X86:
@@ -419,17 +564,17 @@ public:
                 it.detail = std::format(
                     "{} | Vendor: {} | {} logical cores | SSE2:{}  AVX:{}  AVX2:{}  HW virtualization:{}{}",
                     !processor_name.empty() ? processor_name : std::string("x86 CPU"),
-                    !vendor.empty() ? vendor : "unknown",
-                    cores,
-                    has_sse2 ? "Yes" : "No",
-                    has_avx  ? "Yes" : "No",
-                    has_avx2 ? "Yes" : "No",
-                    has_vt   ? "Available" : "Not reported",
-                    identifier.empty() ? "" : std::string(" | Identifier: ") + identifier
+                                        !vendor.empty() ? vendor : "unknown",
+                                        cores,
+                                        has_sse2 ? "Yes" : "No",
+                                        has_avx  ? "Yes" : "No",
+                                        has_avx2 ? "Yes" : "No",
+                                        has_vt   ? "Available" : "Not reported",
+                                        identifier.empty() ? "" : std::string(" | Identifier: ") + identifier
                 );
                 it.recommendation =
-                    "Excellent Linux support. Any mainstream x86-64 distribution should work well.";
-                break;
+                "Excellent Linux support. Any mainstream x86-64 distribution should work well.";
+                                        break;
             }
 
             case Architecture::ARM:
@@ -445,18 +590,18 @@ public:
                 it.detail = std::format(
                     "{} | Vendor: {} | {} logical cores | ARMv8:{}  Crypto:{}  CRC32:{}  ARMv8.1 atomics:{}  SVE:{}  SVE2:{}",
                     !processor_name.empty() ? processor_name : std::string("ARM CPU"),
-                    !vendor.empty() ? vendor : "unknown",
-                    cores,
-                    armv8 ? "Yes" : "No",
-                    crypto ? "Yes" : "No",
-                    crc32 ? "Yes" : "No",
-                    atom ? "Yes" : "No",
-                    sve ? "Yes" : "No",
-                    sve2 ? "Yes" : "No"
+                                        !vendor.empty() ? vendor : "unknown",
+                                        cores,
+                                        armv8 ? "Yes" : "No",
+                                        crypto ? "Yes" : "No",
+                                        crc32 ? "Yes" : "No",
+                                        atom ? "Yes" : "No",
+                                        sve ? "Yes" : "No",
+                                        sve2 ? "Yes" : "No"
                 );
                 it.recommendation =
-                    "ARM Linux is supported, but package and driver availability depends on the exact SoC/device. Prefer a distribution image built for your ARM architecture.";
-                break;
+                "ARM Linux is supported, but package and driver availability depends on the exact SoC/device. Prefer a distribution image built for your ARM architecture.";
+                                        break;
             }
 
             default:
@@ -465,11 +610,11 @@ public:
                     "Architecture: {} | Vendor: {} | {} logical cores",
                     arch_name,
                     !vendor.empty() ? vendor : "unknown",
-                    cores
+                                        cores
                 );
                 it.recommendation =
-                    "This CPU architecture is not specifically covered by the checker. Verify Linux kernel and distribution support for the target platform.";
-                break;
+                "This CPU architecture is not specifically covered by the checker. Verify Linux kernel and distribution support for the target platform.";
+                    break;
         }
     }
 };
@@ -510,79 +655,106 @@ public:
 class StorageAnalyzer : public Analyzer {
 public:
     void analyze(CompatReport& report) override {
-        ULARGE_INTEGER free_bytes{}, total_bytes{};
-        GetDiskFreeSpaceExA("C:\\", &free_bytes, &total_bytes, nullptr);
-        const unsigned long long total_gb = total_bytes.QuadPart / (1024ULL * 1024 * 1024);
-        const unsigned long long free_gb  = free_bytes.QuadPart  / (1024ULL * 1024 * 1024);
+        char windows_dir[MAX_PATH]{};
+        const UINT windows_len = GetWindowsDirectoryA(windows_dir, ARRAYSIZE(windows_dir));
+        char system_root[] = "C:\\";
+        if (windows_len >= 3 && windows_len < ARRAYSIZE(windows_dir)
+            && windows_dir[1] == ':' && windows_dir[2] == '\\') {
+            system_root[0] = windows_dir[0];
+            }
 
-        bool is_ssd  = false;
-        bool is_nvme = false;
+            ULARGE_INTEGER free_bytes{}, total_bytes{};
+        const bool disk_space_ok = GetDiskFreeSpaceExA(
+            system_root, &free_bytes, &total_bytes, nullptr) != FALSE;
+            if (!disk_space_ok) {
+                free_bytes.QuadPart = 0;
+                total_bytes.QuadPart = 0;
+            }
 
-        /*
-         * PhysicalDrive0'ı sabit varsaymak yanlış olurdu; işletim sistemi
-         * farklı bir diskte (ör. NVMe Drive1'de, SATA veri Drive0'da)
-         * olabilir. Önce C: birimini açıp hangi fiziksel diske ait
-         * olduğunu IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS ile öğreniyoruz.
-         */
-        DWORD physDriveNumber = 0;   /* varsayılan */
-        {
-            HANDLE hVol = CreateFileA("\\\\.\\C:",
-                                      0,
-                                      FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                      nullptr, OPEN_EXISTING, 0, nullptr);
-            if (hVol != INVALID_HANDLE_VALUE) {
-                alignas(VOLUME_DISK_EXTENTS)
-                char extBuf[sizeof(VOLUME_DISK_EXTENTS) + 3 * sizeof(DISK_EXTENT)]{};
-                DWORD extBytes = 0;
-                if (DeviceIoControl(hVol, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
-                                    nullptr, 0,
-                                    extBuf, sizeof(extBuf),
-                                    &extBytes, nullptr))
-                {
-                    auto* vde = reinterpret_cast<VOLUME_DISK_EXTENTS*>(extBuf);
-                    if (vde->NumberOfDiskExtents > 0)
-                        physDriveNumber = vde->Extents[0].DiskNumber;
+            const unsigned long long total_gb = total_bytes.QuadPart / (1024ULL * 1024 * 1024);
+            const unsigned long long free_gb  = free_bytes.QuadPart  / (1024ULL * 1024 * 1024);
+
+            bool is_ssd  = false;
+            bool is_nvme = false;
+            bool storage_class_known = false;
+
+            /*
+             * PhysicalDrive0'ı sabit varsaymak yanlış olurdu; işletim sistemi
+             * farklı bir diskte (ör. NVMe Drive1'de, SATA veri Drive0'da)
+             * olabilir. Önce sistem sürücüsünü açıp hangi fiziksel diske ait
+             * olduğunu IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS ile öğreniyoruz.
+             */
+            DWORD physDriveNumber = 0;   /* varsayılan */
+            {
+                HANDLE hVol = CreateFileA(system_root,
+                                          0,
+                                          FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                          nullptr, OPEN_EXISTING, 0, nullptr);
+                if (hVol != INVALID_HANDLE_VALUE) {
+                    alignas(VOLUME_DISK_EXTENTS)
+                    char extBuf[sizeof(VOLUME_DISK_EXTENTS) + 3 * sizeof(DISK_EXTENT)]{};
+                    DWORD extBytes = 0;
+                    if (DeviceIoControl(hVol, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                        nullptr, 0,
+                        extBuf, sizeof(extBuf),
+                                        &extBytes, nullptr))
+                    {
+                        auto* vde = reinterpret_cast<VOLUME_DISK_EXTENTS*>(extBuf);
+                        if (vde->NumberOfDiskExtents > 0)
+                            physDriveNumber = vde->Extents[0].DiskNumber;
+                    }
+                    CloseHandle(hVol);
                 }
-                CloseHandle(hVol);
             }
-        }
 
-        char drivePath[32]{};
-        snprintf(drivePath, sizeof(drivePath), "\\\\.\\PhysicalDrive%lu", physDriveNumber);
+            char drivePath[32]{};
+            snprintf(drivePath, sizeof(drivePath), "\\\\.\\PhysicalDrive%lu", physDriveNumber);
 
-        HANDLE hDisk = CreateFileA(drivePath, 0,
-                                   FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                   nullptr, OPEN_EXISTING, 0, nullptr);
-        if (hDisk != INVALID_HANDLE_VALUE) {
-            DWORD bytes_returned = 0;
-            STORAGE_PROPERTY_QUERY        spq_seek{};
-            DEVICE_SEEK_PENALTY_DESCRIPTOR dsp{};
-            spq_seek.PropertyId = StorageDeviceSeekPenaltyProperty;
-            spq_seek.QueryType  = PropertyStandardQuery;
-            if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &spq_seek, sizeof(spq_seek), &dsp, sizeof(dsp), &bytes_returned, nullptr))
-                is_ssd = !dsp.IncursSeekPenalty;
+            HANDLE hDisk = CreateFileA(drivePath, 0,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                       nullptr, OPEN_EXISTING, 0, nullptr);
+            if (hDisk != INVALID_HANDLE_VALUE) {
+                DWORD bytes_returned = 0;
+                STORAGE_PROPERTY_QUERY        spq_seek{};
+                DEVICE_SEEK_PENALTY_DESCRIPTOR dsp{};
+                spq_seek.PropertyId = StorageDeviceSeekPenaltyProperty;
+                spq_seek.QueryType  = PropertyStandardQuery;
+                if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &spq_seek, sizeof(spq_seek), &dsp, sizeof(dsp), &bytes_returned, nullptr)) {
+                    is_ssd = !dsp.IncursSeekPenalty;
+                    storage_class_known = true;
+                }
 
-            STORAGE_PROPERTY_QUERY spq_desc{};
-            spq_desc.PropertyId = StorageDeviceProperty;
-            spq_desc.QueryType  = PropertyStandardQuery;
-            char desc_buf[2048]{};
-            if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &spq_desc, sizeof(spq_desc), desc_buf, sizeof(desc_buf), &bytes_returned, nullptr)) {
-            const auto* desc = reinterpret_cast<const STORAGE_DEVICE_DESCRIPTOR*>(desc_buf);
-                is_nvme = (desc->BusType == BusTypeNvme);
+                STORAGE_PROPERTY_QUERY spq_desc{};
+                spq_desc.PropertyId = StorageDeviceProperty;
+                spq_desc.QueryType  = PropertyStandardQuery;
+                char desc_buf[2048]{};
+                if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &spq_desc, sizeof(spq_desc), desc_buf, sizeof(desc_buf), &bytes_returned, nullptr)) {
+                    const auto* desc = reinterpret_cast<const STORAGE_DEVICE_DESCRIPTOR*>(desc_buf);
+                    is_nvme = (desc->BusType == BusTypeNvme);
+                }
+                CloseHandle(hDisk);
             }
-            CloseHandle(hDisk);
-        }
 
-        const char* drive_type = is_nvme ? "NVMe SSD" : is_ssd ? "SATA SSD" : "Mekanik Disk (HDD)";
+            const char* drive_type = is_nvme
+            ? "NVMe SSD"
+            : is_ssd
+            ? "SSD"
+            : storage_class_known
+            ? "Mekanik Disk (HDD)"
+            : "Depolama türü belirlenemedi";
 
-        CompatItem* itp = new_item(report);
-        if (!itp) return;
-        CompatItem& it = *itp;
+            CompatItem* itp = new_item(report);
+            if (!itp) return;
+            CompatItem& it = *itp;
         it.category    = std::string(CAT_DISK);
-        it.name        = std::format("Depolama: {} GB Toplam / {} GB Boş  [{}]", total_gb, free_gb, drive_type);
+        it.name        = std::format("Sistem diski: {} GB Toplam / {} GB Boş  [{}]", total_gb, free_gb, drive_type);
         it.critical    = true;
 
-        if (free_gb < 20) {
+        if (!disk_space_ok) {
+            it.score          = CompatScore::MAYBE;
+            it.detail         = "Sistem sürücüsünün boş alanı GetDiskFreeSpaceEx ile okunamadı.";
+            it.recommendation = "Windows sistem sürücüsünün erişilebilir olduğundan emin olun ve uygulamayı yönetici olarak yeniden çalıştırın.";
+        } else if (free_gb < 20) {
             it.score          = CompatScore::NONE;
             it.detail         = std::format("Boş alan: {} GB — Linux kurulumu için genellikle en az 20 GB gereklidir.", free_gb);
             it.recommendation = "C sürücünüzde yer açın veya kurulum için farklı bir disk/bölüm kullanın.";
@@ -870,13 +1042,13 @@ class VirtualizationAnalyzer : public Analyzer {
 public:
     void analyze(CompatReport& report) override {
         /* CPUID leaf 0x40000000 was x86-specific. Instead, use the
-           architecture-neutral Win32 processor feature API. Note that
-           PF_VIRT_FIRMWARE_ENABLED means hardware virtualization is enabled
-           and exposed to Windows; it does NOT by itself prove that we are
-           running inside a virtual machine. */
+         *           architecture-neutral Win32 processor feature API. Note that
+         *           PF_VIRT_FIRMWARE_ENABLED means hardware virtualization is enabled
+         *           and exposed to Windows; it does NOT by itself prove that we are
+         *           running inside a virtual machine. */
         constexpr DWORD PF_VIRT_FIRMWARE = 21;
         const bool virtualization_available =
-            IsProcessorFeaturePresent(PF_VIRT_FIRMWARE) != FALSE;
+        IsProcessorFeaturePresent(PF_VIRT_FIRMWARE) != FALSE;
 
         if (!virtualization_available)
             return;
@@ -909,20 +1081,20 @@ public:
                                                            nullptr, WINHTTP_NO_REFERER,
                                                            WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
 
-        std::string raw_body;
-        if (hRequest && WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
-                     && WinHttpReceiveResponse(hRequest, nullptr)) {
-            char   chunk[512]{};
-            DWORD  bytes_read = 0;
-            while (WinHttpReadData(hRequest, chunk, sizeof(chunk) - 1, &bytes_read) && bytes_read > 0) {
-                chunk[bytes_read] = '\0';
-                raw_body += chunk;
-            }
-        }
+                                                           std::string raw_body;
+                                                           if (hRequest && WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+                                                               && WinHttpReceiveResponse(hRequest, nullptr)) {
+                                                               char   chunk[512]{};
+                                                           DWORD  bytes_read = 0;
+                                                           while (WinHttpReadData(hRequest, chunk, sizeof(chunk) - 1, &bytes_read) && bytes_read > 0) {
+                                                               chunk[bytes_read] = '\0';
+                                                               raw_body += chunk;
+                                                           }
+                                                               }
 
-        if (hRequest) WinHttpCloseHandle(hRequest);
-        if (hConnect) WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+                                                               if (hRequest) WinHttpCloseHandle(hRequest);
+                                                               if (hConnect) WinHttpCloseHandle(hConnect);
+                                                               WinHttpCloseHandle(hSession);
 
         std::string kernel_ver;
         {
@@ -1023,10 +1195,10 @@ public:
         }
 
         printf("\n%s%s  🐧 DISTRIBUTION RECOMMENDATIONS\n\n%s", BOLD, WHITE, RESET);
-        printf("     1. Ubuntu 24.04 LTS  — widest driver support and easy installation.\n");
-        printf("     2. Linux Mint 22     — familiar layout for Windows users and beginner friendly.\n");
-        printf("     3. Fedora 40         — bleeding-edge kernel and good hardware support.\n");
-        printf("     4. Pop!_OS 24.04     — good default driver support for NVIDIA systems.\n");
+        printf("     1. Ubuntu LTS         — wide driver support and easy installation.\n");
+        printf("     2. Linux Mint         — familiar layout for Windows users and beginner friendly.\n");
+        printf("     3. Fedora             — current kernel and strong hardware support.\n");
+        printf("     4. Pop!_OS           — convenient NVIDIA setup when supported by the current release.\n");
         printf("     5. EndeavourOS       — Arch-based choice for advanced users who want full control.\n");
 
         printf("\n%s  🌐 Internet status: %s%s\n%s", DIM,
@@ -1071,6 +1243,12 @@ inline constexpr std::array<StepMeta, 10> PIPELINE_STEPS{{
  * ANA UYGULAMA (ENTRY POINT)
  * ================================================================= */
 int main(int argc, char* argv[]) {
+    if (!Elevation::is_process_elevated()) {
+        if (!Elevation::relaunch_as_administrator())
+            return 1;
+        return 0;
+    }
+
     std::string save_path;
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--save" && i + 1 < argc) {
