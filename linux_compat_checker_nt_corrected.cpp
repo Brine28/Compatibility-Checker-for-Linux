@@ -7,7 +7,9 @@
  *
  * Win32 çağrısının NT karşılığı:
  *   RegOpenKeyEx/RegQueryValueEx   -> NtOpenKey / NtQueryValueKey / NtEnumerateKey
- *   SetupDi* (cihaz listesi)       -> Enum kayıt defteri ağacı + NtPlugPlayControl
+ *   SetupDi* (cihaz listesi)       -> Enum kayıt defteri ağacı
+ *   NtPlugPlayControl varsayılan olarak kapalıdır; belge dışıdır ve Wine'da
+ *   uygulanmamış/kararsız olabilir. Yerel Windows'ta açıkça etkinleştirilebilir.
  *   GlobalMemoryStatusEx           -> NtQuerySystemInformation(SystemBasicInformation)
  *   GetNativeSystemInfo            -> RtlGetNativeSystemInformation + KUSER_SHARED_DATA
  *   IsProcessorFeaturePresent      -> KUSER_SHARED_DATA.ProcessorFeatures
@@ -43,6 +45,9 @@
  *   x86_64-w64-mingw32-windres linux_compat_checker.rc -O coff -o manifest.o
  *   x86_64-w64-mingw32-g++ -O2 -std=c++20 -mconsole linux_compat_checker_nt.cpp manifest.o \
  *       -o linux_compat_checker_nt_x64.exe -lntdll
+ *   Wine uyumluluğu için NtPlugPlayControl varsayılan olarak kapalıdır.
+ *   Yalnızca yerel Windows'ta filtreyi açmak için -DNT_ENABLE_UNDOCUMENTED_PNP_CONTROL
+ *   tanımlanabilir.
  *   (arm64: aarch64-w64-mingw32-*, x86: i686-w64-mingw32-*)
  */
 
@@ -176,10 +181,10 @@ namespace nt {
         USHORT ProcessorArchitecture, ProcessorLevel, ProcessorRevision, MaximumProcessors;
         ULONG  ProcessorFeatureBits;
     };
-    struct alignas(8) SYSTEM_BOOT_ENVIRONMENT_INFORMATION {
+    struct SYSTEM_BOOT_ENVIRONMENT_INFORMATION {
         uint8_t  BootIdentifier[16];
         ULONG    FirmwareType;          /* 1 = BIOS, 2 = UEFI */
-        uint64_t BootFlags;
+        ULONG    BootFlags;
     };
     struct SYSTEM_SECUREBOOT_INFORMATION {
         BOOLEAN SecureBootEnabled;
@@ -342,8 +347,14 @@ namespace Proc {
     [[nodiscard]] inline bool processor_feature(unsigned id) noexcept {      /* ProcessorFeatures @0x274 */
         return id < 64 && shared_data()[0x274 + id] != 0;
     }
-    [[nodiscard]] inline uint32_t active_processor_count() noexcept {        /* ActiveProcessorCount @0x3C0 */
-        return *reinterpret_cast<const volatile uint32_t*>(shared_data() + 0x3C0);
+    [[nodiscard]] inline uint32_t active_processor_count() noexcept {
+        /* Sabit KUSER_SHARED_DATA ofsetine bağımlı kalmadan NT API ile sorgula. */
+        SYSTEM_BASIC_INFORMATION sbi{};
+        if (!success(NtQuerySystemInformation(SystemBasicInformation, &sbi, sizeof(sbi), nullptr)))
+            return 0;
+        return sbi.NumberOfProcessors > 0
+            ? static_cast<uint32_t>(sbi.NumberOfProcessors)
+            : 0;
     }
     [[nodiscard]] inline wchar_t system_drive_letter() noexcept {            /* NtSystemRoot @0x30: "C:\WINDOWS" */
         const volatile wchar_t* root = reinterpret_cast<const volatile wchar_t*>(shared_data() + 0x30);
@@ -369,7 +380,7 @@ namespace Io {
     }
 
     inline bool write_all(HANDLE h, const char* data, std::size_t len) {
-        if (!h) return false;
+        if (!h || h == reinterpret_cast<HANDLE>(static_cast<intptr_t>(-1))) return false;
         while (len > 0) {
             std::size_t chunk = std::min<std::size_t>(len, 32768);
             /* UTF-8 çok baytlı karakteri ortadan bölme */
@@ -380,9 +391,11 @@ namespace Io {
                                       static_cast<ULONG>(chunk), nullptr, nullptr);
             st = wait_if_pending(h, st, io);
             if (!success(st)) return false;
-            const std::size_t written = io.Information ? io.Information : chunk;
+            const std::size_t written = static_cast<std::size_t>(io.Information);
+            if (written == 0 || written > chunk || written > len)
+                return false;
             data += written;
-            len  -= std::min(len, written);
+            len  -= written;
         }
         return true;
     }
@@ -439,7 +452,8 @@ namespace In {
     inline void wait_enter() {
         Out::flush();
         auto* p = Proc::params();
-        if (!p || !p->StandardInput) return;
+        if (!p || !p->StandardInput ||
+            p->StandardInput == reinterpret_cast<HANDLE>(static_cast<intptr_t>(-1))) return;
         char line[256];
         IO_STATUS_BLOCK io{};
         NTSTATUS st = NtReadFile(p->StandardInput, nullptr, nullptr, nullptr, &io, line, sizeof(line), nullptr, nullptr);
@@ -555,10 +569,13 @@ public:
         double total_weight = 0.0;
 
         for (const auto& item : items) {
-            int s = static_cast<int>(item.score);
-            ++score_counts[s];
-            double w       = item.critical ? 2.0 : 1.0;
-            double contrib = (3.0 - static_cast<double>(s)) / 3.0;
+            const int raw_score = static_cast<int>(item.score);
+            if (raw_score < 0 || raw_score >= static_cast<int>(score_counts.size()))
+                continue;
+            const int s = raw_score;
+            ++score_counts[static_cast<std::size_t>(s)];
+            const double w       = item.critical ? 2.0 : 1.0;
+            const double contrib = (3.0 - static_cast<double>(s)) / 3.0;
             weighted      += contrib * w;
             total_weight  += w;
         }
@@ -630,10 +647,24 @@ namespace Registry {
                     continue;
                 }
                 if (!success(st)) return std::nullopt;
-                const auto* p = reinterpret_cast<const KEY_VALUE_PARTIAL_INFORMATION*>(buf.data());
+
+                constexpr std::size_t type_offset = offsetof(KEY_VALUE_PARTIAL_INFORMATION, Type);
+                constexpr std::size_t length_offset = offsetof(KEY_VALUE_PARTIAL_INFORMATION, DataLength);
+                constexpr std::size_t data_offset = offsetof(KEY_VALUE_PARTIAL_INFORMATION, Data);
+                if (ret < data_offset || buf.size() < data_offset)
+                    return std::nullopt;
+
+                ULONG type = 0;
+                ULONG data_length = 0;
+                std::memcpy(&type, buf.data() + type_offset, sizeof(type));
+                std::memcpy(&data_length, buf.data() + length_offset, sizeof(data_length));
+                if (data_length > static_cast<std::size_t>(ret) - data_offset)
+                    return std::nullopt;
+
                 Value v;
-                v.type = p->Type;
-                v.data.assign(p->Data, p->Data + p->DataLength);
+                v.type = type;
+                v.data.assign(buf.begin() + static_cast<std::ptrdiff_t>(data_offset),
+                              buf.begin() + static_cast<std::ptrdiff_t>(data_offset + data_length));
                 return v;
             }
         }
@@ -672,8 +703,21 @@ namespace Registry {
                     continue;
                 }
                 if (!success(st)) break;               /* STATUS_NO_MORE_ENTRIES dahil */
-                const auto* ki = reinterpret_cast<const KEY_BASIC_INFORMATION*>(buf.data());
-                names.emplace_back(ki->Name, ki->NameLength / sizeof(wchar_t));
+
+                constexpr std::size_t name_length_offset = offsetof(KEY_BASIC_INFORMATION, NameLength);
+                constexpr std::size_t name_offset = offsetof(KEY_BASIC_INFORMATION, Name);
+                if (ret < name_offset || buf.size() < name_offset)
+                    break;
+                ULONG name_length = 0;
+                std::memcpy(&name_length, buf.data() + name_length_offset, sizeof(name_length));
+                if ((name_length % sizeof(wchar_t)) != 0 ||
+                    name_length > static_cast<std::size_t>(ret) - name_offset)
+                    break;
+
+                std::wstring name(name_length / sizeof(wchar_t), L'\0');
+                if (name_length != 0)
+                    std::memcpy(name.data(), buf.data() + name_offset, name_length);
+                names.push_back(std::move(name));
                 ++idx;
             }
             return names;
@@ -681,11 +725,14 @@ namespace Registry {
 
     private:
         [[nodiscard]] static std::string first_string(const Value& v) {
-            const auto* w = reinterpret_cast<const wchar_t*>(v.data.data());
             const std::size_t max_n = v.data.size() / sizeof(wchar_t);
+            if (max_n == 0) return {};
+
+            std::wstring w(max_n, L'\0');
+            std::memcpy(w.data(), v.data.data(), max_n * sizeof(wchar_t));
             std::size_t n = 0;
             while (n < max_n && w[n] != L'\0') ++n;
-            return to_utf8(w, n);
+            return to_utf8(w.data(), n);
         }
 
         HANDLE h_ = nullptr;
@@ -815,42 +862,70 @@ namespace DeviceDb {
         return d;
     }
 
-    /* Wine, ntdll'de "wine_get_version" dışa aktarır; gerçek Windows'ta yoktur.
-     * Wine'da NtPlugPlayControl yalnızca bir stub'dır ve çağrılınca süreci düşürür. */
+#if defined(NT_ENABLE_UNDOCUMENTED_PNP_CONTROL)
+    /* Yalnızca yerel Windows üzerinde, açıkça etkinleştirildiğinde kullanılır.
+     * Wine sürümlerinin bir kısmında NtPlugPlayControl uygulanmamıştır; çağrı
+     * uygulamayı sonlandırabileceği için varsayılan derlemede kapalıdır. */
     [[nodiscard]] inline bool running_under_wine() {
         static const bool wine = [] {
             wchar_t name[] = L"ntdll.dll";
-            UNICODE_STRING dll{ sizeof(name) - sizeof(wchar_t), sizeof(name), name };
+            UNICODE_STRING dll{ static_cast<USHORT>(sizeof(name) - sizeof(wchar_t)),
+                                static_cast<USHORT>(sizeof(name)), name };
             HANDLE mod = nullptr;
             if (!success(LdrGetDllHandle(nullptr, nullptr, &dll, &mod)) || !mod) return false;
             char fn[] = "wine_get_version";
-            ANSI_STRING_MIN as{ sizeof(fn) - 1, sizeof(fn), fn };
+            ANSI_STRING_MIN as{ static_cast<USHORT>(sizeof(fn) - 1),
+                                static_cast<USHORT>(sizeof(fn)), fn };
             void* addr = nullptr;
-            return success(LdrGetProcedureAddress(mod, &as, 0, &addr)) && addr;
+            return success(LdrGetProcedureAddress(mod, &as, 0, &addr)) && addr != nullptr;
         }();
         return wine;
     }
 
     [[nodiscard]] inline bool is_present(const std::wstring& instance_id) {
-        if (running_under_wine()) return true;   /* PnP durum sorgusu Wine'da yok; hepsi "mevcut" sayılır */
+        if (running_under_wine()) return true;
         PLUGPLAY_CONTROL_STATUS_DATA d{};
         const auto instance_opt = Registry::make_us(instance_id);
         if (!instance_opt) return false;
         d.DeviceInstance = *instance_opt;
         d.Operation      = 0;
         const NTSTATUS st = NtPlugPlayControl(PlugPlayControlDeviceStatus, &d, sizeof(d));
-        if (st == STATUS_NO_SUCH_DEVICE) return false;
-        if (success(st) && d.DeviceProblem == 45 /*CM_PROB_PHANTOM*/) return false;
+        if (!success(st)) return false;
+        return d.DeviceProblem != 45; /* CM_PROB_PHANTOM */
+    }
+#else
+    /* Enum kayıt defteri hayalet/önceden bağlanmış aygıtlar içerebilir.
+     * Çökme riski taşıyan belgelenmemiş NtPlugPlayControl varsayılan olarak
+     * çağrılmaz; bu modda mevcutluk filtresi yaklaşık olarak uygulanır. */
+    [[nodiscard]] inline bool is_present(const std::wstring& instance_id) {
+        (void)instance_id;
         return true;
     }
+#endif
 
     /* Kayıt defteri okunamazsa nullptr */
     [[nodiscard]] inline const std::vector<Device>* all() {
         static bool ok = false;
         static std::vector<Device> devices;
         static const bool once = [] {
-            BOOLEAN old = 0;
-            RtlAdjustPrivilege(SE_LOAD_DRIVER_PRIVILEGE, 1, 0, &old);   /* NtPlugPlayControl için */
+#if defined(NT_ENABLE_UNDOCUMENTED_PNP_CONTROL)
+            struct PrivilegeScope {
+                BOOLEAN previous_enabled = 0;
+                bool changed = false;
+
+                PrivilegeScope() noexcept {
+                    changed = success(RtlAdjustPrivilege(SE_LOAD_DRIVER_PRIVILEGE, 1, 0,
+                                                         &previous_enabled));
+                }
+                ~PrivilegeScope() {
+                    if (changed) {
+                        BOOLEAN ignored = 0;
+                        (void)RtlAdjustPrivilege(SE_LOAD_DRIVER_PRIVILEGE, previous_enabled, 0,
+                                                 &ignored);
+                    }
+                }
+            } privilege_scope; /* Ayrıcalığı yalnızca PnP taraması boyunca etkin tut. */
+#endif
 
             const std::wstring root = L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum";
             Registry::Key kroot;
@@ -867,8 +942,9 @@ namespace DeviceDb {
                         Registry::Key ki;
                         if (!ki.open(root + L"\\" + rel)) continue;
 
-                        auto desc = ki.string(L"DeviceDesc");
-                        if (!desc) continue;                       /* SPDRP_DEVICEDESC okunamadıysa atla */
+                        auto desc = ki.string(L"FriendlyName");
+                        if (!desc || desc->empty()) desc = ki.string(L"DeviceDesc");
+                        if (!desc || desc->empty()) continue;
                         if (!is_present(rel)) continue;
 
                         Device d;
@@ -1003,10 +1079,11 @@ public:
                 const bool has_avx2 = feature(PF_AVX2);
                 const bool has_vt   = feature(PF_VIRT_FIRMWARE);
 
-                it.score = CompatScore::FULL;
+                it.score = (arch == Architecture::X64) ? CompatScore::FULL : CompatScore::MAYBE;
                 it.detail = std::format(
-                    "{} | Vendor: {} | {} logical cores | SSE2:{}  AVX:{}  AVX2:{}  HW virtualization:{}{}",
+                    "{} | Architecture: {} | Vendor: {} | {} logical cores | SSE2:{}  AVX:{}  AVX2:{}  HW virtualization:{}{}",
                     !processor_name.empty() ? processor_name : std::string("x86 CPU"),
+                    arch_name,
                     !vendor.empty() ? vendor : "unknown",
                     cores,
                     has_sse2 ? "Yes" : "No",
@@ -1015,8 +1092,9 @@ public:
                     has_vt   ? "Available" : "Not reported",
                     identifier.empty() ? "" : std::string(" | Identifier: ") + identifier
                 );
-                it.recommendation =
-                "Excellent Linux support. Any mainstream x86-64 distribution should work well.";
+                it.recommendation = (arch == Architecture::X64)
+                    ? "Excellent Linux support. Any mainstream x86-64 distribution should work well."
+                    : "A 32-bit x86 system was detected. Verify that the chosen distribution still provides a supported 32-bit image; many mainstream releases now focus on x86-64.";
                 break;
             }
 
@@ -1029,10 +1107,11 @@ public:
                 const bool sve    = feature(PF_ARM_SVE);
                 const bool sve2   = feature(PF_ARM_SVE2);
 
-                it.score = CompatScore::FULL;
+                it.score = (arch == Architecture::ARM64) ? CompatScore::FULL : CompatScore::MAYBE;
                 it.detail = std::format(
-                    "{} | Vendor: {} | {} logical cores | ARMv8:{}  Crypto:{}  CRC32:{}  ARMv8.1 atomics:{}  SVE:{}  SVE2:{}",
+                    "{} | Architecture: {} | Vendor: {} | {} logical cores | ARMv8:{}  Crypto:{}  CRC32:{}  ARMv8.1 atomics:{}  SVE:{}  SVE2:{}",
                     !processor_name.empty() ? processor_name : std::string("ARM CPU"),
+                    arch_name,
                     !vendor.empty() ? vendor : "unknown",
                     cores,
                     armv8 ? "Yes" : "No",
@@ -1042,8 +1121,9 @@ public:
                     sve ? "Yes" : "No",
                     sve2 ? "Yes" : "No"
                 );
-                it.recommendation =
-                "ARM Linux is supported, but package and driver availability depends on the exact SoC/device. Prefer a distribution image built for your ARM architecture.";
+                it.recommendation = (arch == Architecture::ARM64)
+                    ? "ARM64 Linux is broadly supported, but package and driver availability depends on the exact SoC/device. Prefer an image built for your ARM64 platform."
+                    : "A 32-bit ARM system was detected. Support varies significantly by board and distribution; verify that an actively maintained image exists for this exact device.";
                 break;
             }
 
@@ -1067,18 +1147,29 @@ public:
     void analyze(CompatReport& report) override {
         SYSTEM_BASIC_INFORMATION sbi{};
         unsigned long long total_mb = 0;
-        if (success(NtQuerySystemInformation(SystemBasicInformation, &sbi, sizeof(sbi), nullptr)))
-            total_mb = static_cast<unsigned long long>(sbi.NumberOfPhysicalPages) * sbi.PageSize / (1024ULL * 1024);
+        const bool memory_query_ok =
+            success(NtQuerySystemInformation(SystemBasicInformation, &sbi, sizeof(sbi), nullptr)) &&
+            sbi.PageSize > 0 && sbi.NumberOfPhysicalPages > 0;
+        if (memory_query_ok) {
+            total_mb = static_cast<unsigned long long>(sbi.NumberOfPhysicalPages) *
+                       static_cast<unsigned long long>(sbi.PageSize) / (1024ULL * 1024);
+        }
         const unsigned long long total_gb = total_mb / 1024;
 
         CompatItem* itp = new_item(report);
         if (!itp) return;
         CompatItem& it = *itp;
         it.category    = std::string(CAT_RAM);
-        it.name        = std::format("System memory: {} MB ({} GB)", total_mb, total_gb);
+        it.name        = memory_query_ok
+            ? std::format("System memory: {} MB ({} GB)", total_mb, total_gb)
+            : "System memory: unable to query";
         it.critical    = true;
 
-        if (total_mb < 2048) {
+        if (!memory_query_ok) {
+            it.score          = CompatScore::MAYBE;
+            it.detail         = "NtQuerySystemInformation(SystemBasicInformation) failed or returned invalid memory values.";
+            it.recommendation = "Verify the Windows environment and rerun the checker; memory capacity could not be determined.";
+        } else if (total_mb < 2048) {
             it.score          = CompatScore::NONE;
             it.detail         = std::format("Only {} MB of RAM detected; most Linux desktop environments need at least 1–2 GB.", total_mb);
             it.recommendation = "At least 4 GB of RAM is recommended. Consider lightweight distributions such as Lubuntu, Xubuntu, or Alpine Linux.";
@@ -1103,7 +1194,9 @@ public:
         unsigned long long total_bytes = 0, free_bytes = 0;
         bool disk_space_ok = false;
         {
-            const std::wstring root = std::wstring(L"\\??\\") + letter + L":\\";
+            std::wstring root = L"\\??\\";
+            root.push_back(letter);
+            root.append(L":\\");
             HANDLE h = Io::open_nt(root, FILE_READ_ATTRIBUTES_ | SYNCHRONIZE_, FILE_SHARE_ALL,
                                    FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
             if (h) {
@@ -1136,7 +1229,9 @@ public:
         ULONG phys_drive_number = 0;
         bool phys_drive_known = false;
         {
-            const std::wstring vol = std::wstring(L"\\??\\") + letter + L":";
+            std::wstring vol = L"\\??\\";
+            vol.push_back(letter);
+            vol.append(L":");
             HANDLE hVol = Io::open_nt(vol, FILE_READ_ATTRIBUTES_ | SYNCHRONIZE_, FILE_SHARE_ALL,
                                       FILE_SYNCHRONOUS_IO_NONALERT);
             if (hVol) {
@@ -1152,7 +1247,8 @@ public:
             }
         }
 
-        const std::wstring drive_path = L"\\??\\PhysicalDrive" + std::to_wstring(phys_drive_number);
+        std::wstring drive_path = L"\\??\\PhysicalDrive";
+        drive_path.append(std::to_wstring(phys_drive_number));
         HANDLE hDisk = phys_drive_known
             ? Io::open_nt(drive_path, FILE_READ_ATTRIBUTES_ | SYNCHRONIZE_, FILE_SHARE_ALL,
                           FILE_SYNCHRONOUS_IO_NONALERT)
@@ -1222,9 +1318,10 @@ class GpuAnalyzer : public Analyzer {
 public:
     void analyze(CompatReport& report) override {
         bool matched = false;
-        const bool enumerated = enumerate_devices(CLS_DISPLAY, [&](std::string_view name, std::string_view /*hw_id*/) {
+        const bool enumerated = enumerate_devices(CLS_DISPLAY, [&](std::string_view name, std::string_view hw_id) {
             matched = true;
             auto has = [&](std::string_view s) { return DeviceDb::icontains(name, s); };
+            auto has_id = [&](std::string_view s) { return DeviceDb::icontains(hw_id, s); };
 
             CompatItem* itp = new_item(report);
             if (!itp) return;
@@ -1233,9 +1330,9 @@ public:
             it.name        = std::string(name);
             it.critical    = true;
 
-            const bool is_nvidia  = has("NVIDIA") || has("GeForce") || has("Quadro") || has("RTX") || has("GTX");
-            const bool is_amd_gpu = has("AMD")    || has("Radeon")  || has("RX ");
-            const bool is_intel_g = has("Intel")  || has("UHD")     || has("Iris") || has("Arc");
+            const bool is_nvidia  = has("NVIDIA") || has("GeForce") || has("Quadro") || has("RTX") || has("GTX") || has_id("VEN_10DE");
+            const bool is_amd_gpu = has("AMD")    || has("Radeon")  || has("RX ") || has_id("VEN_1002");
+            const bool is_intel_g = has("Intel")  || has("UHD")     || has("Iris") || has("Arc") || has_id("VEN_8086");
             const bool is_virtual = has("VMware") || has("VirtualBox") || has("Microsoft Basic Render") || has("SVGA");
 
             if (is_nvidia) {
@@ -1294,11 +1391,11 @@ public:
             it.category    = std::string(CAT_NET);
             it.name        = std::string(name);
 
-            const bool is_intel_net = has("Intel");
-            const bool is_realtek   = has("Realtek");
-            const bool is_broadcom  = has("Broadcom");
-            const bool is_atheros   = has("Atheros") || has("Killer");
-            const bool is_mediatek  = has("MediaTek") || has("Ralink");
+            const bool is_intel_net = has("Intel") || DeviceDb::icontains(hw_id, "VEN_8086");
+            const bool is_realtek   = has("Realtek") || DeviceDb::icontains(hw_id, "VEN_10EC");
+            const bool is_broadcom  = has("Broadcom") || DeviceDb::icontains(hw_id, "VEN_14E4");
+            const bool is_atheros   = has("Atheros") || has("Killer") || DeviceDb::icontains(hw_id, "VEN_168C") || DeviceDb::icontains(hw_id, "VEN_1969");
+            const bool is_mediatek  = has("MediaTek") || has("Ralink") || DeviceDb::icontains(hw_id, "VEN_14C3") || DeviceDb::icontains(hw_id, "VEN_1814");
             const bool is_wifi      = has("Wi-Fi") || has("Wireless") || has("WLAN");
 
             if (is_intel_net) {
@@ -1404,31 +1501,39 @@ public:
 class FirmwareAnalyzer : public Analyzer {
 public:
     void analyze(CompatReport& report) override {
-        /* UEFI mi? SystemBootEnvironmentInformation.FirmwareType (1=BIOS, 2=UEFI) */
-        bool is_uefi = false;
+        /* Firmware türünü sorgu ve kayıt defteri ikisi de doğrulayamıyorsa bilinmiyor bırak. */
+        std::optional<bool> is_uefi;
         {
             SYSTEM_BOOT_ENVIRONMENT_INFORMATION sbe{};
-            if (success(NtQuerySystemInformation(SystemBootEnvironmentInformation, &sbe, sizeof(sbe), nullptr)))
+            if (success(NtQuerySystemInformation(SystemBootEnvironmentInformation, &sbe, sizeof(sbe), nullptr)) &&
+                (sbe.FirmwareType == 1 || sbe.FirmwareType == 2)) {
                 is_uefi = (sbe.FirmwareType == 2);
-            else
-                is_uefi = (Registry::read_dword(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control",
-                                                L"PEFirmwareType").value_or(0) == 2);
+            } else {
+                const auto firmware_type = Registry::read_dword(
+                    L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control", L"PEFirmwareType");
+                if (firmware_type && (*firmware_type == 1 || *firmware_type == 2))
+                    is_uefi = (*firmware_type == 2);
+            }
         }
 
-        /* Secure Boot: SystemSecureBootInformation, olmazsa kayıt defteri */
-        bool secure_boot = false;
+        /* Secure Boot: sorgu başarısızsa bunu otomatik olarak DISABLED sayma. */
+        std::optional<bool> secure_boot;
         {
             SYSTEM_SECUREBOOT_INFORMATION ssi{};
-            if (success(NtQuerySystemInformation(SystemSecureBootInformation, &ssi, sizeof(ssi), nullptr)))
+            if (success(NtQuerySystemInformation(SystemSecureBootInformation, &ssi, sizeof(ssi), nullptr))) {
                 secure_boot = (ssi.SecureBootEnabled != 0);
-            else
-                secure_boot = (Registry::read_dword(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State",
-                                                    L"UEFISecureBootEnabled").value_or(0) != 0);
+            } else {
+                const auto registry_value = Registry::read_dword(
+                    L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State",
+                    L"UEFISecureBootEnabled");
+                if (registry_value) secure_boot = (*registry_value != 0);
+            }
         }
 
-        /* TPM: takılı aygıtlar arasında TPM 2.0 ACPI kimlikleri / adı aranır */
-        bool has_tpm = false;
+        /* TPM: aygıt ağacı okunamazsa "yok" sonucu çıkarma. */
+        std::optional<bool> has_tpm;
         if (const auto* list = DeviceDb::all()) {
+            has_tpm = false;
             for (const auto& d : *list) {
                 if (DeviceDb::icontains(d.hw_id, "MSFT0101") || DeviceDb::icontains(d.hw_id, "MSFT0200") ||
                     DeviceDb::icontains(d.name, "Trusted Platform Module") ||
@@ -1449,17 +1554,22 @@ public:
             if (!itp) return;
             CompatItem& it = *itp;
             it.category    = std::string(CAT_FW);
-            it.name        = std::format("Boot type: {}  |  BIOS: {} {}", is_uefi ? "UEFI" : "Legacy BIOS", bios_vendor, bios_ver);
+            const char* boot_type = !is_uefi ? "Unknown" : (*is_uefi ? "UEFI" : "Legacy BIOS");
+            it.name        = std::format("Boot type: {}  |  BIOS: {} {}", boot_type, bios_vendor, bios_ver);
             it.critical    = true;
 
-            if (is_uefi) {
+            if (!is_uefi) {
+                it.score          = CompatScore::MAYBE;
+                it.detail         = "The firmware boot type could not be determined from the NT API or registry.";
+                it.recommendation = "Verify whether Windows was booted in UEFI or Legacy BIOS mode before choosing the Linux installer mode.";
+            } else if (*is_uefi) {
                 it.score          = CompatScore::FULL;
-                it.detail         = "Modern UEFI system detected. GRUB2 and systemd-boot installers should work fine.";
+                it.detail         = "UEFI firmware boot detected. GRUB2 and systemd-boot installers commonly support this mode.";
                 it.recommendation = "Install Linux in UEFI mode and ensure the EFI System Partition is selected.";
             } else {
                 it.score          = CompatScore::MINOR;
-                it.detail         = "Legacy BIOS system detected. Linux can be installed, but GPT or Secure Boot may not be available.";
-                it.recommendation = "Use MBR partitioning during installation if your system does not support UEFI.";
+                it.detail         = "Legacy BIOS boot detected. Linux can be installed, but GPT boot and Secure Boot options may be limited.";
+                it.recommendation = "Use a partitioning/boot configuration supported by the firmware; MBR may be required on legacy-only systems.";
             }
         }
 
@@ -1469,17 +1579,21 @@ public:
             if (!itp2) return;
             CompatItem& it = *itp2;
             it.category    = std::string(CAT_SB);
-            it.name        = std::format("Secure Boot: {}", secure_boot ? "ENABLED" : "DISABLED");
+            it.name        = std::format("Secure Boot: {}", !secure_boot ? "UNKNOWN" : (*secure_boot ? "ENABLED" : "DISABLED"));
             it.critical    = false;
 
-            if (secure_boot) {
+            if (!secure_boot) {
+                it.score          = CompatScore::MAYBE;
+                it.detail         = "Secure Boot status could not be determined from the NT API or registry.";
+                it.recommendation = "Check Secure Boot status in the firmware setup or Windows System Information.";
+            } else if (*secure_boot) {
                 it.score          = CompatScore::MINOR;
-                it.detail         = "Secure Boot is currently ENABLED. Many distros like Ubuntu and Fedora support it, but some may still have issues.";
-                it.recommendation = "If installing Arch, Gentoo, or Manjaro, you may need to disable Secure Boot in BIOS.";
+                it.detail         = "Secure Boot is currently ENABLED. Many distributions support it, but custom bootloaders or unsigned modules may need additional steps.";
+                it.recommendation = "Check the target distribution's Secure Boot documentation before disabling it.";
             } else {
                 it.score          = CompatScore::FULL;
-                it.detail         = "Secure Boot is disabled. Most Linux distributions should boot without restrictions.";
-                it.recommendation = "No action is required.";
+                it.detail         = "Secure Boot is reported as disabled. Most Linux distributions should boot without Secure Boot restrictions.";
+                it.recommendation = "No action is required unless you want to enable Secure Boot after installation.";
             }
         }
 
@@ -1489,11 +1603,19 @@ public:
             if (!itp3) return;
             CompatItem& it    = *itp3;
             it.category       = std::string(CAT_TPM);
-            it.name           = std::format("Trusted Platform Module (TPM): {}", has_tpm ? "Present" : "Not detected");
+            it.name           = std::format("Trusted Platform Module (TPM): {}",
+                                            !has_tpm ? "Unknown" : (*has_tpm ? "Present" : "Not detected"));
             it.critical       = false;
-            it.score          = CompatScore::FULL;
-            it.detail         = has_tpm ? "TPM is present — manageable with tpm2-tools on Linux." : "No TPM hardware detected.";
-            it.recommendation = "TPM can be used for LUKS encryption keys or secure boot workflows if desired.";
+            if (!has_tpm) {
+                it.score          = CompatScore::MAYBE;
+                it.detail         = "The device registry could not be enumerated, so TPM presence could not be verified.";
+                it.recommendation = "Check TPM status in Windows Security or firmware settings.";
+            } else {
+                it.score          = CompatScore::FULL;
+                it.detail         = *has_tpm ? "TPM is present — it can be managed with tpm2-tools on Linux."
+                                             : "No TPM device was detected in the enumerated device tree.";
+                it.recommendation = "TPM can be used for LUKS encryption keys or Secure Boot workflows if desired.";
+            }
         }
     }
 };
@@ -1507,7 +1629,7 @@ public:
         if (!sbs.BatteryPresent) return;                 // Masaüstü ise atla
 
         const int pct = (sbs.MaxCapacity > 0)
-            ? static_cast<int>(static_cast<unsigned long long>(sbs.RemainingCapacity) * 100 / sbs.MaxCapacity)
+            ? std::clamp(static_cast<int>(static_cast<unsigned long long>(sbs.RemainingCapacity) * 100 / sbs.MaxCapacity), 0, 100)
             : 0;
         const bool on_ac = (sbs.AcOnLine != 0);
 
